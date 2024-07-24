@@ -10,7 +10,11 @@
 #define PTR_TO_UINT64(p) ((uintptr_t)(p))
 #define UINT64_TO_PTR(u) ((void *)(u))
 
-#define IDX_PTR(dev, x) (void *)(dev->data + (x << SECTOR_SHIFT))
+#define CSL_SECTOR_SHIFT 9
+#define CSL_SECTOR_SIZE (1 << CSL_SECTOR_SHIFT)
+#define TOTAL_SECTORS 32768
+
+#define IDX_PTR(dev, x) (void *)(dev->data + (x << CSL_SECTOR_SHIFT))
 
 #define LIST_ENTRY_INIT(entry, __idx) \
     entry->idx = __idx;

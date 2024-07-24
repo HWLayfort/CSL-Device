@@ -13,7 +13,6 @@
 #include "type.h"
 
 /* Define the total number of sectors and device name */
-#define TOTAL_SECTORS 32768
 #define DEVICE_NAME "csl"
 #define PROMPT "csl_dev: "
 #define PATH "/tmp/csl_dev_meta"
@@ -21,8 +20,13 @@
 #define FREELIST_PATH "/tmp/csl_dev_freelist"
 #define DIRTYLIST_PATH "/tmp/csl_dev_dirtylist"
 
-#ifdef _USE_MUTEX
 
+/* if DEBUG is enabled, print debug message */
+#define DEBUG_MESSAGE(fmt, ...) \
+	if (IS_ENABLED(DEBUG))  \
+		printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
+
+#ifdef _USE_MUTEX
 #define GET_READ_LOCK(dev)      \
 	mutex_lock(&dev->reader_cnt_mutex);      \
 	dev->reader_nr++;        \
@@ -39,9 +43,7 @@
 	mutex_lock(&dev->rw_mutex);
 #define RELEASE_WRITE_LOCK(dev) \
 	mutex_unlock(&dev->rw_mutex);
-
 #elif _USE_SEMAPHORE
-
 #define GET_READ_LOCK(dev)      \
 	down(&dev->reader_cnt_mutex);      \
 	dev->reader_nr++;        \
@@ -58,9 +60,7 @@
 	down(&dev->rw_mutex);
 #define RELEASE_WRITE_LOCK(dev) \
 	up(&dev->rw_mutex);
-
 #else
-
 #define GET_READ_LOCK(dev)      \
 	read_lock(&dev->rwlock);
 #define RELEASE_READ_LOCK(dev)  \
@@ -69,12 +69,7 @@
 	write_lock(&dev->rwlock);
 #define RELEASE_WRITE_LOCK(dev) \
 	write_unlock(&dev->rwlock);
-
 #endif
-
-#define DEBUG_MESSAGE(fmt, ...) \
-	if (IS_ENABLED(DEBUG))  \
-		printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
 
 /* Module information */
 MODULE_LICENSE("GPL");
@@ -124,24 +119,18 @@ static void print_metadata(struct csl_device *dev)
 	struct sector_mapping_entry *ptr;
 	pr_info("%sBlock Map\n", PROMPT);
 
-	// print all block mapping in the map as table format
-	pr_info("%s| Logical Block Index | Phyiscal Block Index |\n", PROMPT);
-	pr_info("%s|---------------------|----------------------|\n", PROMPT);
+	pr_info("|--------------------------------------------|\n");
+	pr_info("| Logical Block Index | Phyiscal Block Index |\n");
+	pr_info("|---------------------|----------------------|\n");
 	xa_for_each(&dev->map, idx, ptr)
-		pr_info("%s| %-19d | %20d |\n", PROMPT, ptr->l_idx, ptr->p_idx);
-	pr_info("%s|--------------------------------------------|\n", PROMPT);
+		pr_info("| %-19d | %20d |\n", ptr->l_idx, ptr->p_idx);
+	pr_info("|--------------------------------------------|\n");
 
 	pr_info("%sFree Block Count: %ld\n", PROMPT, list_count_nodes(&dev->freelist));
 	pr_info("%sDirty Block Count: %ld\n", PROMPT, list_count_nodes(&dev->dirtylist));
 }
 
-/**
- * Garbage collecting
- * 1. Find the first block in the dirty list
- * 2. Clear the block -> I think we don't have to do this in our device
- * 3. Remove the block from the dirty list
- * 4. Add the block to the free list
- */
+/* Garbage collecting function */
 static void garbage_collecting(struct csl_device *dev)
 {
 	DEBUG_MESSAGE("%sFree list is empty. Garbage collecting\n", PROMPT);
@@ -150,13 +139,6 @@ static void garbage_collecting(struct csl_device *dev)
 
 	list_for_each_entry_safe(tmp, n, &dev->dirtylist, list)
 	{
-		/**
-		 * Clear the block
-		 * I think we don't have to do this in this device
-		 *
-		 * void *ptr = GET_PTR(dev, tmp->idx);
-		 * memset(ptr, 0, SECTOR_SIZE);
-		 */
 		list_del(&tmp->list);
 		list_add_tail(&tmp->list, &dev->freelist);
 	}
@@ -261,7 +243,7 @@ static int dev_request_handle(struct request *rq, unsigned int *nr_bytes)
 	struct bio_vec bvec;
 	struct req_iterator iter;
 	struct csl_device *dev = rq->q->queuedata;
-	loff_t pos = blk_rq_pos(rq) << SECTOR_SHIFT;
+	loff_t pos = blk_rq_pos(rq) << CSL_SECTOR_SHIFT;
 	loff_t dev_size = (loff_t)(dev->size);
 
 	/* Iterate over each segment of the request */
@@ -273,7 +255,7 @@ static int dev_request_handle(struct request *rq, unsigned int *nr_bytes)
 		if ((pos + b_len) > dev_size)
 			b_len = (unsigned long)(dev_size - pos);
 
-		unsigned long idx = pos >> SECTOR_SHIFT;
+		unsigned long idx = pos >> CSL_SECTOR_SHIFT;
 
 		DEBUG_MESSAGE("%sBlock length: %ld, Block index: %ld, Request direction: %s\n", PROMPT, b_len, idx, rq_data_dir(rq) == WRITE ? "WRITE" : "READ");
 
@@ -282,7 +264,6 @@ static int dev_request_handle(struct request *rq, unsigned int *nr_bytes)
 			write_sector(dev, idx, b_buf, b_len);
 		else
 			read_sector(dev, idx, b_buf, b_len);
-
 
 		if (IS_ENABLED(DEBUG))
 			print_metadata(dev);
@@ -311,7 +292,7 @@ static blk_status_t dev_request(struct blk_mq_hw_ctx *hctx, const struct blk_mq_
 		BUG();
 	}
 
-	__blk_mq_end_request(rq, status);
+	blk_mq_end_request(rq, status);
 
 	return status;
 }
@@ -493,7 +474,7 @@ static int __init csl_driver_init(void)
 	INIT_LIST_HEAD(&dev->dirtylist);
 
 	/* Set device capacity */
-	dev->size = TOTAL_SECTORS * SECTOR_SIZE;
+	dev->size = TOTAL_SECTORS << CSL_SECTOR_SHIFT;
 
 	/* Allocate memory for the data buffer */
 	if (load_metadata() != 0) {
@@ -560,7 +541,7 @@ static int __init csl_driver_init(void)
 	set_capacity(dev->disk, dev->size >> SECTOR_SHIFT);
 
 	/* Set the logical block size */
-	blk_queue_logical_block_size(dev->queue, SECTOR_SIZE);
+	blk_queue_logical_block_size(dev->queue, CSL_SECTOR_SIZE);
 
 	/* Add the disk to the system */
 	status = add_disk(dev->disk);

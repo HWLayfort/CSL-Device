@@ -2,7 +2,7 @@ obj-m := csl_dev.o
 csl_dev-objs := dev.o metadata.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
-RESET_DEVICE = 0
+RESET_DEVICE = 1
 
 all:
 	make -C $(KDIR) M=$(PWD) modules
