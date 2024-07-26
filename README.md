@@ -134,7 +134,7 @@ read 알고리즘은 다음과 같이 작동한다. 먼저, `read lock`을 획�
 
 ###  3.1. <a name='type.h'></a>type.h
 
-구현에 필요한 data structure들을 선언하는 파일이다. 
+`type.h` 파일은 디바이스 드라이버 구현에 필요한 데이터 구조를 선언하는 파일이다. 이 파일은 `csl_device`, `sector_mapping_entry`, `sector_list_entry`등 드라이버의 운영에 필수적인 다양한 타입과 구조체를 정의한다.
 
 ###  3.2. <a name='file.h'></a>file.h
 
@@ -144,7 +144,7 @@ file.h 파일은 파일 open/close를 위한 wrapping 매크로들을 정의하�
 
 `metadata.h`와 `metadata.c` 파일은 드라이버의 작동을 위해 필요한 메타데이터를 저장하고 불러오는 API를 구현한 파일이다. 메타데이터에는 `data buffer address`, `map`, `free list`, `dirty list`이 포함된다. 이 데이터들은 driver의 consistency를 위해서 반드시 보관되어야하므로 local에 저장되어 module init될 때 불러오고 exit될 때 저장되어야 한다. 이를 위해서 init과 	exit에서 메타데이터 저장하는 기능을 해당 파일에 구현하였다.
 
-해당 파일의 핵심적인 함수는 다음과 같다.
+해당 파일의 핵심적인 함수는 다음과 같다.	
 
 ```c
 int initialize_memory(struct csl_device *dev);
@@ -157,10 +157,6 @@ void save_metadata(struct csl_device *dev);
 
 `dev.c` 파일은 디바이스 드라이버의 주요 기능을 구현하는 파일이다. 이 파일은 `read`, `write`, `garbage collecting`과 같은 기능을 드라이브 핵심 기능을 구현하고 있으며, 또한 `init`과 `exit`와 같이 드라이버의 생명주기를 관리하는 기능을 구현하고 있다.
 
-해당 파일의 핵심적인 함수는 다음과 같다.
-
-```c
-
 ##  4. <a name='test'></a>test
 
 ###  4.1. <a name='ReadWrite'></a>Read/Write
@@ -169,7 +165,11 @@ void save_metadata(struct csl_device *dev);
 
 ###  4.3. <a name='DisplayMapping'></a>Display Mapping
 
+`dev.c`에 메타데이터의 정합성을 디버깅하기 위해서 `map`, `freelist`, `dirtylist`의 정보를 출력하는 함수인 `print_metadata`함수를 구현하였다. 해당 함수는 `map` 데이터를 table 형태로 출력하고, `freelist`와 `dirtylist`는 현재 저장된 데이터의 갯수만을 출력한다.
+
 ###  4.4. <a name='Synchronization'></a>Synchronization
+
+`Synchronization`
 
 ##  5. <a name='Experiment'></a>Experiment
 
