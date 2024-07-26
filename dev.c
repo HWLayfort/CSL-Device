@@ -7,25 +7,13 @@
 #include <linux/hdreg.h>
 #include <linux/xarray.h>
 #include <linux/delay.h>
+#include <linux/version.h>
 
 #include "file.h"
 #include "metadata.h"
 #include "type.h"
 
-/* Define the total number of sectors and device name */
-#define DEVICE_NAME "csl"
-#define PROMPT "csl_dev: "
-#define PATH "/tmp/csl_dev_meta"
-#define MAP_PATH "/tmp/csl_dev_map"
-#define FREELIST_PATH "/tmp/csl_dev_freelist"
-#define DIRTYLIST_PATH "/tmp/csl_dev_dirtylist"
-
-
 /* if DEBUG is enabled, print debug message */
-#define DEBUG_MESSAGE(fmt, ...) \
-	if (IS_ENABLED(DEBUG))  \
-		printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
-
 #ifdef _USE_MUTEX
 #define GET_READ_LOCK(dev)      \
 	mutex_lock(&dev->reader_cnt_mutex);      \
@@ -302,142 +290,12 @@ static struct blk_mq_ops csl_dev_mq_ops = {
     .queue_rq = dev_request,
 };
 
-static int initialize_memory(void)
-{
-	struct file *file = file_create(PATH);
-
-	if (IS_ERR(file)) {
-		pr_err("%sFailed to create metadata file. Errorcode: %ld\n", PROMPT, PTR_ERR(file));
-		return PTR_ERR(file);
-	}
-
-	file_close(file);
-
-	dev->data = vmalloc(dev->size);
-
-	if (!dev->data) {
-		pr_err("%sFailed to allocate data buffer\n", PROMPT);
-		return -ENOMEM;
-	}
-
-	DEBUG_MESSAGE("%sMemory initialized\n", PROMPT);
-
-	return 0;
-}
-
-static int initialize_metadata(void)
-{
-	if (!dev->data)
-		initialize_memory();
-	
-	struct file *freefile = file_create(FREELIST_PATH);
-	struct file *dirtyfile = file_create(DIRTYLIST_PATH);
-	struct file *mapfile = file_create(MAP_PATH);
-
-	if (!freefile || !dirtyfile || !mapfile) {
-		pr_err("%sFailed to create metadata files\n", PROMPT);
-		return -1;
-	}
-
-	file_close(freefile);
-	file_close(dirtyfile);
-	file_close(mapfile);
-
-	for (int i = 0; i < TOTAL_SECTORS; i++) {
-		struct sector_list_entry *item = (struct sector_list_entry *)kmalloc(sizeof(struct sector_list_entry), GFP_KERNEL);
-		item->idx = i;
-		list_add_tail(&item->list, &dev->freelist);
-	}
-
-	DEBUG_MESSAGE("%sMetadata initialized\n", PROMPT);
-
-	return 0;
-}
-
-static int load_metadata(void)
-{
-	struct file *file = file_open_read(PATH);
-	if (IS_ERR(file)) {
-		if (PTR_ERR(file) == -ENOENT) {
-			pr_info("%sMemory file not exist\n", PROMPT);
-			goto initialize_memory;
-		}
-		else {
-			pr_err("%sMemory file crushed. Initialize Memory.\n", PROMPT);
-			goto initialize_memory;
-		}
-	}
-
-	load_ptr(file, (void **)&dev->data);
-	file_close(file);
-
-	if (__reset_device) {
-		pr_info("%sReset device\n", PROMPT);
-		vfree(dev->data);
-		goto initialize_memory;
-	}
-
-	struct file *freefile = NULL;
-	struct file *dirtyfile = NULL;
-	struct file *mapfile = NULL;
-
-	freefile = file_open_read(FREELIST_PATH);
-	dirtyfile = file_open_read(DIRTYLIST_PATH);
-	mapfile = file_open_read(MAP_PATH);
-
-	if (IS_ERR(freefile) || IS_ERR(dirtyfile) || IS_ERR(mapfile)) {
-		if ((PTR_ERR(freefile) == -ENOENT) && (PTR_ERR(dirtyfile) == -ENOENT) && (PTR_ERR(mapfile) == -ENOENT)) {
-			pr_info("%sMetadata file not exist\n", PROMPT);
-			goto initialize_metadata;
-		}
-		else {
-			pr_err("%sMetadata file crushed. Initialize Metadata.\n", PROMPT);
-			goto initialize_metadata;
-		}
-	}
-
-	load_list(freefile, &dev->freelist);
-	load_list(dirtyfile, &dev->dirtylist);
-	load_xa(mapfile, &dev->map);
-
-	file_close(freefile);
-	file_close(dirtyfile);
-	file_close(mapfile);
-
-	DEBUG_MESSAGE("%sMetadata loaded\n", PROMPT);
-
-	return 0;
-
-initialize_memory:
-	initialize_memory();
-
-initialize_metadata:
-	return initialize_metadata();
-}
-
-static void save_metadata(void)
-{
-	struct file *file = file_open(PATH);
-	struct file *freefile = file_open(FREELIST_PATH);
-	struct file *dirtyfile = file_open(DIRTYLIST_PATH);
-	struct file *mapfile = file_open(MAP_PATH);
-
-	save_ptr(file, (void *)dev->data);
-	save_list(freefile, &dev->freelist);
-	save_list(dirtyfile, &dev->dirtylist);
-	save_xa(mapfile, &dev->map);
-
-	file_close(file);
-	file_close(freefile);
-	file_close(dirtyfile);
-	file_close(mapfile);
-
-	DEBUG_MESSAGE("%sMetadata saved\n", PROMPT);
-}
-
 /* Initialize the csl driver */
 static int __init csl_driver_init(void)
 {
+	if (LINUX_VERSION_CODE < KERNEL_VERSION(6,9,5))
+		pr_err("%sKernel version is too old\n", PROMPT);
+
 	int status = 0;
 
 	/* Register the block device */
@@ -477,7 +335,7 @@ static int __init csl_driver_init(void)
 	dev->size = TOTAL_SECTORS << CSL_SECTOR_SHIFT;
 
 	/* Allocate memory for the data buffer */
-	if (load_metadata() != 0) {
+	if (load_metadata(dev, __reset_device) != 0) {
 		pr_err("%sFailed to load metadata\n", PROMPT);
 		status = -ENOMEM;
 		goto dev_allocation_fail;
@@ -578,7 +436,7 @@ dev_register_fail:
 /* Exit the csl driver */
 static void __exit csl_driver_exit(void)
 {
-	save_metadata();
+	save_metadata(dev);
 	del_gendisk(dev->disk);
 	put_disk(dev->disk);
 	blk_mq_free_tag_set(dev->tag_set);

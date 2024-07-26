@@ -1,31 +1,32 @@
 [global]
 bs=512
-iodepth=16
+iodepth=32
 direct=1
 ioengine=libaio
 filename=/dev/csl
 group_reporting=1
 time_based=1
 runtime=10
+numjobs=4
 size=4MB
-rw=write
 
-[csl_test_1]
-numjobs=1
-stonewall
+; [csl_test_1]
+; rw=rw
+; stonewall
 
 [csl_test_2]
-numjobs=2
+rw=randrw
 stonewall
 
-[csl_test_3]
-numjobs=4
-stonewall
+; [csl_test_3]
+; numjobs=4
+; stonewall
 
-[csl_test_4]
-numjobs=8
-stonewall
+; [csl_test_4]
+; numjobs=8
+; stonewall
 
-[csl_test_5]
-numjobs=16
-stonewall
+; [csl_test_5]
+; numjobs=16
+; stonewall
+

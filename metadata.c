@@ -83,3 +83,136 @@ int save_xa(struct file *file, struct xarray *xa) {
 
     return 0;
 }
+
+int initialize_memory(struct csl_device *dev)
+{
+	struct file *file = file_create(PATH);
+
+	if (IS_ERR(file)) {
+		pr_err("%sFailed to create metadata file. Errorcode: %ld\n", PROMPT, PTR_ERR(file));
+		return PTR_ERR(file);
+	}
+
+	file_close(file);
+
+	dev->data = vmalloc(dev->size);
+
+	if (!dev->data) {
+		pr_err("%sFailed to allocate data buffer\n", PROMPT);
+		return -ENOMEM;
+	}
+
+	DEBUG_MESSAGE("%sMemory initialized\n", PROMPT);
+
+	return 0;
+}
+
+int initialize_metadata(struct csl_device *dev)
+{
+	if (!dev->data)
+		initialize_memory(dev);
+	
+	struct file *freefile = file_create(FREELIST_PATH);
+	struct file *dirtyfile = file_create(DIRTYLIST_PATH);
+	struct file *mapfile = file_create(MAP_PATH);
+
+	if (!freefile || !dirtyfile || !mapfile) {
+		pr_err("%sFailed to create metadata files\n", PROMPT);
+		return -1;
+	}
+
+	file_close(freefile);
+	file_close(dirtyfile);
+	file_close(mapfile);
+
+	for (int i = 0; i < TOTAL_SECTORS; i++) {
+		struct sector_list_entry *item = (struct sector_list_entry *)kmalloc(sizeof(struct sector_list_entry), GFP_KERNEL);
+		item->idx = i;
+		list_add_tail(&item->list, &dev->freelist);
+	}
+
+	DEBUG_MESSAGE("%sMetadata initialized\n", PROMPT);
+
+	return 0;
+}
+
+int load_metadata(struct csl_device *dev, int reset_device)
+{
+	struct file *file = file_open_read(PATH);
+	if (IS_ERR(file)) {
+		if (PTR_ERR(file) == -ENOENT) {
+			pr_info("%sMemory file not exist\n", PROMPT);
+			goto initialize_memory;
+		}
+		else {
+			pr_err("%sMemory file crushed. Initialize Memory.\n", PROMPT);
+			goto initialize_memory;
+		}
+	}
+
+	load_ptr(file, (void **)&dev->data);
+	file_close(file);
+
+	if (reset_device) {
+		pr_info("%sReset device\n", PROMPT);
+		vfree(dev->data);
+		goto initialize_memory;
+	}
+
+	struct file *freefile = NULL;
+	struct file *dirtyfile = NULL;
+	struct file *mapfile = NULL;
+
+	freefile = file_open_read(FREELIST_PATH);
+	dirtyfile = file_open_read(DIRTYLIST_PATH);
+	mapfile = file_open_read(MAP_PATH);
+
+	if (IS_ERR(freefile) || IS_ERR(dirtyfile) || IS_ERR(mapfile)) {
+		if ((PTR_ERR(freefile) == -ENOENT) && (PTR_ERR(dirtyfile) == -ENOENT) && (PTR_ERR(mapfile) == -ENOENT)) {
+			pr_info("%sMetadata file not exist\n", PROMPT);
+			goto initialize_metadata;
+		}
+		else {
+			pr_err("%sMetadata file crushed. Initialize Metadata.\n", PROMPT);
+			goto initialize_metadata;
+		}
+	}
+
+	load_list(freefile, &dev->freelist);
+	load_list(dirtyfile, &dev->dirtylist);
+	load_xa(mapfile, &dev->map);
+
+	file_close(freefile);
+	file_close(dirtyfile);
+	file_close(mapfile);
+
+	DEBUG_MESSAGE("%sMetadata loaded\n", PROMPT);
+
+	return 0;
+
+initialize_memory:
+	initialize_memory(dev);
+
+initialize_metadata:
+	return initialize_metadata(dev);
+}
+
+void save_metadata(struct csl_device *dev)
+{
+	struct file *file = file_open(PATH);
+	struct file *freefile = file_open(FREELIST_PATH);
+	struct file *dirtyfile = file_open(DIRTYLIST_PATH);
+	struct file *mapfile = file_open(MAP_PATH);
+
+	save_ptr(file, (void *)dev->data);
+	save_list(freefile, &dev->freelist);
+	save_list(dirtyfile, &dev->dirtylist);
+	save_xa(mapfile, &dev->map);
+
+	file_close(file);
+	file_close(freefile);
+	file_close(dirtyfile);
+	file_close(mapfile);
+
+	DEBUG_MESSAGE("%sMetadata saved\n", PROMPT);
+}

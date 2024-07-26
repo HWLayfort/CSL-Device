@@ -109,6 +109,9 @@ file open/close를 위해 사용되는 함수를 wrapping한 macro들을 정의�
 
 ### dev.c
 
+## test
+
+
 
 ## Experiment
 
@@ -139,10 +142,9 @@ size=4MB
  Image 4. Random VS Sequential Comparison
 </p>
 
-실험결과 미세하게나마 sequential이 random보다 더 좋은 성능을 보이는 것을 확인할 수 있었다. 이는 드라이버의 구현상에서의 문제가 아니라 I/O Layer에서 request를 setting하는 과정에서 모종의 최적화가 일어난 것으로 추측된다.
+실험결과 미세하게나마 sequential이 random보다 더 좋은 성능을 보이는 것을 확인할 수 있었다. 이는 드라이버의 구현상에서의 문제가 아니라 I/O Layer에서 request를 setting하는 과정에서 cache를 사용하여 최적화를 하고 있기에 발생하는 차이로 보인다. 대표적으로 `submit_fio`과정에서 `blk_mq_peek_cached_request`를 통해서 cache된 request가 있는지 확인하고 있다.
 
 ### Read VS Write
-
 Read는 `Reader-Writer` lock의 특성상 다수의 Reader가 `critical section`에 접근할 수 있기 때문에 numjobs가 늘어나면 늘어날수록 read가 write에 비해서 더 좋은 성능을 보인다. 
 
 <p align="center">
@@ -152,7 +154,7 @@ Read는 `Reader-Writer` lock의 특성상 다수의 Reader가 `critical section`
  Image 5. Read VS Write Comparison
 </p>
 
-read의 경우에는 여러개의 reader가 동시에 접근할 수 있기 때문에 numjobs가 증가할수록 성능이 증가하는 것을 확인할 수 있었다. 그러나 write의 경우에는 `write lock`을 획득하는 과정에서 overhead가 발생하기 때문에 numjobs=4 이후로는 증가할수록 성능이 감소하는 것을 확인할 수 있었다.
+read의 경우에는 여러개의 reader가 동시에 접근할 수 있기 때문에 numjobs가 증가할수록 성능이 증가하는 것을 확인할 수 있었다. 그러나 write의 경우에는 1개의 writer만이 접근가능해야 하므로 numjobs가 증가하여도 1명의 writer만이 쓸 수 있으며 오히려 지나치게 많아지는 경우에는 `write lock`을 획득하는 과정에서 overhead가 과다하게 발생하기 때문에 numjobs=4 이후로는 성능이 감소하는 것을 확인할 수 있었다.
 
 ## Improvement
 
@@ -166,12 +168,26 @@ read의 경우에는 여러개의 reader가 동시에 접근할 수 있기 때�
  <img src = "images/BlockSize.png">
 </p>
 <p align="center" style="font-size:125%">
- Image 7. Block Size Comparison
+ Image 6. Block Size Comparison
 </p>
 
-Block Size가 커짐에 따라서 Bandwith가 3.5배 가량 증가하는 것을 확인할 수 있었다.
+테스트 환경은 다음과 같다.
+```ini
+[global]
+iodepth=16
+direct=1
+ioengine=libaio
+filename=/dev/csl
+group_reporting=1
+numjobs=4
+time_based=1
+runtime=10
+size=4MB
+```
 
-그러나 현재 주어진 sector의 크기를 변경할 수는 없다. 대신에 연속적인 sector를 묶어서 큰 단위의 I/O를 수행하는 방법을 고려해볼 수 있다. 이를 통해 sector size를 변경하지 않고도 큰 단위의 I/O를 수행할 수 있다. 이를 위해서는 연속적인 logical data가 physical data에서도 연속적으로 매핑되도록 하는 것이 필요하다.
+Block Size가 커짐에 따라서 Bandwith가 4.5배 가량 증가하는 것을 확인할 수 있었다.
+
+그러나 주어진 sector의 크기를 변경할 수는 없다. 대신에 연속적인 sector를 묶어서 큰 단위의 I/O를 수행하는 방법을 고려해볼 수 있다. 이를 통해 sector size를 변경하지 않고도 큰 단위의 I/O를 수행할 수 있다. 이를 위해서는 연속적인 logical data가 physical data에서도 연속적으로 매핑되도록 하는 것이 필요하다.
 
 ### Divide Lock
 
@@ -179,11 +195,30 @@ Block Size가 커짐에 따라서 Bandwith가 3.5배 가량 증가하는 것을 
 
 ### Cache
 
-사전에 언급한 바와 같이 현재의 구현은 cache와 같은 optimization이 없다. 따라서 매번 요청이 들어올 때마다 metadata를 읽어오는 과정이 필요하다. 이는 매번 disk에 접근하는 과정이기 때문에 성능에 큰 영향을 미친다. 이를 해결하기 위해서는 metadata를 cache에 저장하는 방법을 고려해볼 수 있다. 이를 통해 매번 disk에 접근하는 과정을 줄일 수 있고, 따라서 성능을 향상시킬 수 있다.
+사전에 언급한 바와 같이 현재의 구현은 cache와 같은 optimization이 없다. 따라서 매번 요청이 들어올 때마다 metadata를 읽어오는 과정이 필요하다. 따라서 이러한 overhead를 줄이기 위해서는 cache를 도입하는 것도 고려해볼수 있다. cache를 도입함으로써 metadata를 더 빠르게 읽어올 수 있게 되고 이를 통해 전체적인 성능을 향상시킬 수 있을 것이다.
 
 ## Discussion
 
 ### Linked List of Linux
+
+`linked list`는 linux에서 매우 많이 사용되는 자료구조이다. 그러나 전통적인 구현으로는 list를 사용하는 구조체마다 개별적인 list API를 가져야만 하였다. 그래서 linux에서는 이를 통합하여 강력한 list API를 제공하기 위해 `container_of`를 이용한 list 시스템을 구현하였다. `container_of`의 구현은 다음과 같다.
+
+```c
+#define container_of(ptr, type, member) ({				\
+	void *__mptr = (void *)(ptr);					\
+	static_assert(__same_type(*(ptr), ((type *)0)->member) ||	\
+		      __same_type(*(ptr), void),			\
+		      "pointer type mismatch in container_of()");	\
+	((type *)(__mptr - offsetof(type, member))); })
+```
+먼저 첫 줄의 `void *__mptr = (void *)(ptr);`를 보자. `ptr`은 `member`가 포함되어 있는 구조체의 포인터이다. 이를 `void *`로 형변환하여 `__mptr`에 저장한다. 다음 줄에서는  `static_assert`를 통해서 `ptr`이 `type`의 `member`에 대한 포인터인지 확인하고 있다. 만약 이 조건이 만족하지 않는다면 컴파일 에러를 발생시킨다. 마지막으로 `__mptr`에서 `member`의 offset만큼 뺀 주소를 반환한다. 이 offset은 `offsetof`를 통해서 구할 수 있다. 이 `offsetof`의 구현은 다음과 같다.
+
+```c
+#define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
+```
+`offsetof`은 `TYPE`의 `MEMBER`가 시작하는 offset을 구하는 매크로이다. 이는 메모리 주소 0에 대해서 MEMBER 만큼의 offset을 더한 주소를 반환함을 통해서 offset을 빠르게 구할 수 있다.
+
+이러한 `container_of`와 `offsetof`를 통해서 linux는 구조체마다 개별적인 list 구현이 필요없이 강력한 list API를 제공할 수 있게 되었다.
 
 ### kmalloc vs vmalloc
 이 둘의 주요 차이점은, kmalloc은 가상/물리 메모리에 연속적인 방식으로 메모리를 할당한다. 그러나 kmalloc과 유사하게 작동하지만 가상 메모리에서는 연속적으로 할당하는 반면 물리 메모리에서는 그렇지 않다는 점이다.
@@ -192,8 +227,144 @@ Block Size가 커짐에 따라서 Bandwith가 3.5배 가량 증가하는 것을 
 
 ### Block Level I/O Layer
 
-```
+linux의 `Block Level I/O Layer`의 개괄은 다음과 같다.
+
+<p align="center">
+ <img src = "images/BlockLayer.png">
+</p>
+<p align="center" style="font-size:125%">
+ Image 7. Block Level I/O Layer
+
+이 과정에서 `Block Layer`에 실질적으로 진입하는 부분은 `submit_bio`함수이다. 이 함수는 `bio`를 받아서 `request`로 변환하고 이를 `block device`에 전달하는 역할을 한다. 하지만 실질적으로 코어 로직을 담고있는 함수는 `blk_mq_submit_bio`이다. 이곳에서 `bio`가 `request`로 변환되고 `request`가 `block device`의 `hardware queue`에 전달되는 과정을 거친다. `blk_mq_submit_bio`의 핵심적인 부분만 살펴보면 다음과 같다.
+
+```c
 void blk_mq_submit_bio(struct bio *bio)
+{
+	// cache된 request가 있는지 확인한다.
+	rq = blk_mq_peek_cached_request(plug, q, bio->bi_opf);
+
+	...
+
+new_request:
+	if (!rq) {
+		// cache된 request가 없는 경우 새로운 request를 생성한다.
+		rq = blk_mq_get_new_requests(q, plug, bio, nr_segs);
+		if (unlikely(!rq))
+			goto queue_exit;
+	} else {
+		// cache된 request가 있는 경우 해당 request를 사용한다.
+		blk_mq_use_cached_rq(rq, plug, bio);
+	}
+
+	...
+
+	// bio를 request로 변환한다.
+	blk_mq_bio_to_request(rq, bio, nr_segs);
+
+	...
+
+	hctx = rq->mq_hctx;
+	// request가 scheduler를 사용하거나 hardware context가 busy하면서 request의 hw queue가 1개이거나 sync가 아닌 경우
+	if ((rq->rq_flags & RQF_USE_SCHED) ||
+	    (hctx->dispatch_busy && (q->nr_hw_queues == 1 || !is_sync))) {
+		// request를 request queue에 삽입한다.
+		blk_mq_insert_request(rq, 0);
+		blk_mq_run_hw_queue(hctx, true);
+	} else {
+		// request를 request queue에 넣치않고 device driver에 바로 전달한다.
+		blk_mq_run_dispatch_ops(q, blk_mq_try_issue_directly(hctx, rq));
+	}
+	return;
+
+	...
+}
+```
+
+`blk_mq_submit_bio`는 준비된 `request`를 크게 2방향으로 나눠서 device에 전달한다. 첫번째는 `request`를 `request queue`에 삽입하고 `hardware queue`를 실행하는 방법이다. `blk_mq_run_hw_queue`가 이 역할을 담당하고 있다. 두번째는 `request`를 `device driver`에 바로 전달하는 방법이다. 이 방법은 `request`를 `hardware queue`에 삽입하지 않고 `device driver`에 바로 전달하는 방법이다. `blk_mq_try_issue_directly`가 이 역할을 담당하고 있다.
+
+먼저 `blk_mq_run_hw_queue`의 중요 부분만 살펴보면 다음과 같다.
+
+```c
+void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
+{
+	...
+
+	if (async || !cpumask_test_cpu(raw_smp_processor_id(), hctx->cpumask)) {
+		blk_mq_delay_run_hw_queue(hctx, 0);
+		return;
+	}
+
+	blk_mq_run_dispatch_ops(hctx->queue,
+				blk_mq_sched_dispatch_requests(hctx));
+}
+```
+
+먼저 함수는 `async`이거나 `cpumask`에 현재 CPU가 포함되어 있지 않은 경우 `blk_mq_delay_run_hw_queue`를 호출한다. 이 함수는 cpu의 `workqueue`에 `htcx`의 `run_work`를 enqueue하는 함수이다. `hctx`의 `run_work`에는 `blk_mq_run_work_fn`가 등록되어있다. 이 함수의 구현은 다음과 같다.
+
+```c
+void blk_mq_sched_dispatch_requests(struct blk_mq_hw_ctx *hctx)
+{
+	...
+
+	/*
+	 * A return of -EAGAIN is an indication that hctx->dispatch is not
+	 * empty and we must run again in order to avoid starving flushes.
+	 */
+	if (__blk_mq_sched_dispatch_requests(hctx) == -EAGAIN) {
+		if (__blk_mq_sched_dispatch_requests(hctx) == -EAGAIN)
+			blk_mq_run_hw_queue(hctx, true);
+	}
+}
+```
+`__blk_mq_sched_dispatch_requests`를 실행하고 결과가 `-EAGAIN`이면 다시 한번 실행한다. 재실행한 결과가 `-EAGAIN`이면 `blk_mq_run_hw_queue`를 다시 호출한다.
+
+따라서 핵심적인 코드는 `__blk_mq_sched_dispatch_requests`에 위치해 있다. 이 함수의 구현의 핵심적인 부분은 다음과 같다.
+
+```c
+static int __blk_mq_sched_dispatch_requests(struct blk_mq_hw_ctx *hctx)
+{
+	...
+
+	if (!list_empty(&rq_list)) {
+		blk_mq_sched_mark_restart_hctx(hctx);
+		if (!blk_mq_dispatch_rq_list(hctx, &rq_list, 0))
+			return 0;
+		need_dispatch = true;
+	} else {
+		need_dispatch = hctx->dispatch_busy;
+	}
+
+	if (hctx->queue->elevator)
+		return blk_mq_do_dispatch_sched(hctx);
+
+	/* dequeue request one by one from sw queue if queue is busy */
+	if (need_dispatch)
+		return blk_mq_do_dispatch_ctx(hctx);
+	blk_mq_flush_busy_ctxs(hctx, &rq_list);
+	blk_mq_dispatch_rq_list(hctx, &rq_list, 0);
+	return 0;
+}
+```
+`__blk_mq_sched_dispatch_requests`는 3가지 경우로 나뉜다. 첫번째는 `rq_list`가 비어있지 않은 경우이다. 이 경우에는 `blk_mq_dispatch_rq_list`를 호출한다. 이 함수는 `hardware queue`의 `rq_queue`를 호출한다. 즉, `request handler`를 호출함을 통해서 현재 hardware의 `request list`를 처리한다. 두번째는 `rq_list`가 비어있는 경우이다. 이 경우에는 `software queue`의 `request`가 아직 `hardware queue`에 전달되지 않았다는 것을 의미한다. 이 경우에는 `blk_mq_do_dispatch_ctx`를 호출한다. 이 함수는 `software queue`에 있는 `request`를 하나씩 `hardware queue`에 전달하는 역할을 한다. 세번째는 `elevator`가 있는 경우이다. 이 경우에는 `blk_mq_do_dispatch_sched`를 호출한다. 이 함수는 `elevator`를 통해서 `request`를 처리하는 역할을 한다.
+
+다시 `blk_mq_run_hw_queue`함수로 돌아가자. Synchronous하게 실행해야 하는 경우 별도로 `workqueue`에 추가하지 않고 direct하게 `blk_mq_sched_dispatch_requests`를 호출한다.
+
+따라서 block device의 request가 전달되어 실행되는 과정은 다음과 같다.
+
+```mermaid
+flowchart TB
+
+A[blk_mq_submit_bio] -->|device busy| B[blk_mq_run_hw_queue]
+A -->|device free| C[blk_mq_run_dispatch_ops]
+B -->|async| D[blk_mq_delay_run_hw_queue]
+B -->|sync| E[blk_mq_sched_dispatch_requests]
+D -->|enqueue to workqueue| E
+E -->|failed| B
+E -->|rq_list not empty| F[blk_mq_dispatch_rq_list]
+E -->|rq_list empty| G[blk_mq_do_dispatch_ctx]
+C -->|single request| H
+F -->|multi request| H[rq_queue/Request Handler]
+G -->|single request| H
 ```
 
 ### nr_hw_queues
@@ -315,7 +486,7 @@ struct mutex {
 ```
 여기서 우리가 눈여겨 볼 멤버는 `owner`, `wait_lock`, `wait_list`이다. `owner`는 `mutex`를 소유하고 있는 `task`의 `pid`를 저장하고 있다. `wait_lock`은 `mutex`를 기다리는 `task`들을 관리하는 `spinlock`이다. `wait_list`는 `wait_lock`을 통해 관리되는 `task`들의 리스트이다. 이 리스트는 `list`로 관리되며, `mutex`를 기다리는 `task`들이 이 리스트에 추가되고 제거된다.
 
-`mutex`가 제공하는 기본적인 API는 `mutex_lock`과 `mutex_unㅉmutex_lock`의 코드를 살펴보자.
+`mutex`가 제공하는 기본적인 API는 `mutex_lock`과 `mutex_unlock`의 코드를 살펴보자.
 
 ```c
 void __sched mutex_lock(struct mutex *lock)
@@ -367,15 +538,69 @@ if (__mutex_trylock(lock) ||
 이제 `mutex`의 `unlock`을 살펴보자. nulock도 마찬가지로 `fast path`와 `slow path`로 나누어진다. `fast path`는 다음과 같다.
 
 ```c
+static __always_inline bool __mutex_unlock_fast(struct mutex *lock)
+{
+	unsigned long curr = (unsigned long)current;
+
+	return atomic_long_try_cmpxchg_release(&lock->owner, &curr, 0UL);
+}
 ```
 즉, 다음으로 실행할 `task`를 지정하지 않고 atomic하게 `owner`를 `0`으로 만들어 다음 `task`가 `mutex`를 얻을 수 있도록 한다. 이 과정은 `spinlock`을 사용하지 않는다. 이를 통해 빠르게 `mutex`를 해제할 수 있다. 이렇게 해제된 lock은 `fast path`나 `mid path`를 통해 경쟁적으로 `mutex`를 얻을 수 있다.
 
 반면에 `slow path`는 다음과 같다.
 
 ```c
+static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigned long ip)
+{
+	struct task_struct *next = NULL;
+	DEFINE_WAKE_Q(wake_q);
+	unsigned long owner;
+
+	mutex_release(&lock->dep_map, ip);
+
+	// mid path
+	owner = atomic_long_read(&lock->owner);
+	for (;;) {
+		MUTEX_WARN_ON(__owner_task(owner) != current);
+		MUTEX_WARN_ON(owner & MUTEX_FLAG_PICKUP);
+
+		if (owner & MUTEX_FLAG_HANDOFF)
+			break;
+
+		if (atomic_long_try_cmpxchg_release(&lock->owner, &owner, __owner_flags(owner))) {
+			if (owner & MUTEX_FLAG_WAITERS)
+				break;
+
+			return;
+		}
+	}
+
+	// slow path
+	raw_spin_lock(&lock->wait_lock);
+	debug_mutex_unlock(lock);
+	if (!list_empty(&lock->wait_list)) {
+		/* get the first entry from the wait-list: */
+		struct mutex_waiter *waiter =
+			list_first_entry(&lock->wait_list,
+					 struct mutex_waiter, list);
+
+		next = waiter->task;
+
+		debug_mutex_wake_waiter(lock, waiter);
+		wake_q_add(&wake_q, next);
+	}
+
+	if (owner & MUTEX_FLAG_HANDOFF)
+		__mutex_handoff(lock, next);
+
+	raw_spin_unlock(&lock->wait_lock);
+
+	wake_up_q(&wake_q);
+}
 ```
-이 경우에는 `wait_list`에 있는 `task`들을 깨우고 `mutex`를 해제한다.
+`slow path`에서도 다시 `mid path`와 `slow path`로 나눠서 동작한다. `mid path`는 `spinlock`을 사용하여 `mutex`를 해제하는 과정이다. 이과정이 실패하게 되면 `mutex`는 `slow path`로 진입하게 된다. `slow path`는 `sleeplock`을 사용하여 `mutex`를 해제하는 과정이다. `slow path`는 전통적인 `sleep lock`의 해제 방법을 사용한다. 이를 통해 `mutex`를 해제하고 `wait_list`에 있는 `task`를 깨우는 과정을 거친다.
 
 ### rwlock in linux
+`Reader-Writer`패턴은 매우 일반적인 synchronize 패턴이다. 리눅스에서는 이 패턴에 대해서 대응하기 위해 `rwlock_t`과 `rw_semaphore`라는 두 가지 lock을 제공하고 있다. 이 두 lock의 차이점은 결국 `spinlock`과 `sleeplock`의 차이이다. `rwlock_t`의 경우에는 `spinlock`을 사용하여 구현한 반면에 `sleeplock`은 근본적으로 `semaphore`를 이용하여 구현하였기에 `sleeplock`에 속한다.
 
 <a name="footnote_1">1</a>: https://junsoolee.gitbook.io/linux-insides-ko/summary/syncprim/linux-sync-4
