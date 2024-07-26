@@ -1,6 +1,43 @@
-## Data Structure
+# CSL Report 2 - Append Only Ramdisk
 
-### Device
+* 1. [Data Structure](#DataStructure)
+	* 1.1. [Device](#Device)
+	* 1.2. [Mapping Entry](#MappingEntry)
+	* 1.3. [List Entry](#ListEntry)
+* 2. [Algorithm](#Algorithm)
+	* 2.1. [Write](#Write)
+	* 2.2. [Read](#Read)
+	* 2.3. [Garbage Collecting](#GarbageCollecting)
+	* 2.4. [Parmanent](#Parmanent)
+* 3. [File Structure](#FileStructure)
+	* 3.1. [type.h](#type.h)
+	* 3.2. [file.h](#file.h)
+	* 3.3. [metadata.h/metadata.c](#metadata.hmetadata.c)
+	* 3.4. [dev.c](#dev.c)
+* 4. [test](#test)
+	* 4.1. [Read/Write](#ReadWrite)
+	* 4.2. [Save/Load Metadata](#SaveLoadMetadata)
+	* 4.3. [Display Mapping](#DisplayMapping)
+	* 4.4. [Synchronization](#Synchronization)
+* 5. [Experiment](#Experiment)
+	* 5.1. [Random VS Sequential](#RandomVSSequential)
+	* 5.2. [Read VS Write](#ReadVSWrite)
+* 6. [Improvement](#Improvement)
+	* 6.1. [Block size](#Blocksize)
+	* 6.2. [Divide Lock](#DivideLock)
+	* 6.3. [Cache](#Cache)
+* 7. [Discussion](#Discussion)
+	* 7.1. [Linked List of Linux](#LinkedListofLinux)
+	* 7.2. [kmalloc vs vmalloc](#kmallocvsvmalloc)
+	* 7.3. [Block Level I/O Layer](#BlockLevelIOLayer)
+	* 7.4. [nr_hw_queues](#nr_hw_queues)
+	* 7.5. [Semaphore vs Mutex](#SemaphorevsMutex)
+	* 7.6. [Additional Mutex](#AdditionalMutex)
+	* 7.7. [rwlock in linux](#rwlockinlinux)
+
+##  1. <a name='DataStructure'></a>Data Structure
+
+###  1.1. <a name='Device'></a>Device
 본 드라이버에서 사용하는 `device`데이터 구조는 다음과 같다.
 
 ```c
@@ -19,7 +56,7 @@ struct csl_device {
 
 기존의 데이터에서 달라진 부분은 mapping을 위한 metadata를 저장하는 `xarray`와 `freelist`, `dirtylist`이다. `xarray`는 `logical block address(LBA)`와 `physical block address(PBA)`를 매핑하기 위한 자료구조이다. `freelist`는 현재 사용되지 않는 블록(`free block`)의 리스트이다. `dirtylist`는 데이터가 변경된 블록의 리스트이다.
 
-### Mapping Entry
+###  1.2. <a name='MappingEntry'></a>Mapping Entry
 `xarray`는 key로서 `unsigned int`를 사용하고 value로는 `void *`를 사용한다. 이 포인터를 통해서 mapping하고자 하는 데이터를 저장한다. 본 구현에서는 이곳에 저장할 데이터로서 다음과 같은 Data Structure를 사용했다.
 
 ```c
@@ -31,8 +68,8 @@ struct sector_mapping_entry {
 
 이 구조체는 `l_idx`와 `p_idx`를 저장하는 구조체이다. `l_idx`는 `logical block address`를 저장하고, `p_idx`는 `physical block address`를 저장한다.
 
-### List Entry
-`freelist`와 `dirtylist`는 `list_head`를 사용하여 구현하였다. `list_head`는 linux에서 사용하는 `linked list node`로서 기능하지만, 일반적인 list와는 사뭇 다르게 사용해야 한다. 일반적인 리스의 경우에는 node struct 내부에 데이터와 다음 node에 대한 포인터를 저장한다. 그러나 `list_head`는 데이터를 저장하지 않고 다음 노드에 대한 포인터만을 저장한다. 대신 `list_head`를 사용하는 구조체가 데이터를 저장하도록 한다. 이는 `list_head`를 사용하는 구조체가 linux상에서 굉장히 많기 때문에 범용적인 활용을 지원하기 위하여 데이터와 링크를 디커플링한 것으로 이해된다. 본 디바이스에서는 list를 위한 data structure를 다음과 같이 정의하였다.
+###  1.3. <a name='ListEntry'></a>List Entry
+`freelist`와 `dirtylist`는 `list_head`를 사용하여 구현하였다. `list_head`는 linux에서 사용하는 `linked list node`로서 기능하지만, 일반적인 list와는 사뭇 다르게 사용해야 한다. 일반적인 리스의 경우에는 node struct 내부에 데이터와 다음 node에 대한 포인터를 저장한다. 그러나 `list_head`는 데이터를 저장하지 않고 다음 노드에 대한 포인터만을 저장한다. 대신 `list_head`를 사용하는 구조체가 데이터를 저장하도록 한다. 이는 `list_head`를 사용하는 구조체가 linux상에서 굉장히 많기 때문에 범용적인 활용을 지원하기 위하여 데이터와 링크를 디커플링한 것으로 이해된다. 자세한 내용은 후술할 [Discussion](#LinkedListofLinux)에서 다루도록 하겠다. 본 디바이스에서는 list를 위한 data structure를 다음과 같이 정의하였다.
 
 ```c
 struct sector_list_entry {
@@ -42,9 +79,9 @@ struct sector_list_entry {
 ```
 `idx`에는 `PBA`를 저장하고 `list`에는 다음 `sector_list_entry`구조체가 포함하고 있는 `list_head`가 저장된다.
 
-## Algorithm
+##  2. <a name='Algorithm'></a>Algorithm
 
-### Write
+###  2.1. <a name='Write'></a>Write
 
 write는 다음과 같은 과정을 거친다.
 
@@ -63,7 +100,7 @@ write 알고리즘은 다음과 같이 작동한다. 먼저, `write lock`을 획
 
 마지막으로, buffer의 데이터를 `free block`으로 복사한 후, `write lock`을 해제한다.
 
-### Read
+###  2.2. <a name='Read'></a>Read
 
 <p align="center">
  <img src = "images/ReadSector.png">
@@ -76,7 +113,7 @@ read 알고리즘은 다음과 같이 작동한다. 먼저, `read lock`을 획�
 
 마지막으로, `read lock`을 해제한다.
 
-### Garbage Collecting
+###  2.3. <a name='GarbageCollecting'></a>Garbage Collecting
 
 <p align="center">
  <img src = "images/GC.png">
@@ -87,35 +124,56 @@ read 알고리즘은 다음과 같이 작동한다. 먼저, `read lock`을 획�
 
 `garbage collection`의 경우에는 특이한 사항없이 `dirtylist`에 있는 블록을 순회하면서 이를 `freelist`에 추가하는 과정을 반복한다.
 
-### Parmanent
+###  2.4. <a name='Parmanent'></a>Parmanent
 
 `kmalloc`이나 `vmalloc`의 경우 kernel memory에 할당되기 때문에 module의 init, exit과 무관하게 kernel space에서 유지된다. 따라서 영구적인 데이터를 위해서는 할당된 메모리의 주소를 기억하고 있는 것이 중요하다. 이를 위해서 init과정과 exit과정에서 각각 file에 read/write함을 통해서 주소를 저장하는 방식으로 이를 유지하였다.
 
 `data buffer address`이외에도 `map`, `freelist`, `dirtylist`의 데이터 역시 저장/블러올 수 있도록 구현하였다. 이를 통해 init/exit 과정에서 해당 데이터를 저장하고 불러올 수 있도록 하였다.
 
-## File Structure
+##  3. <a name='FileStructure'></a>File Structure
 
-### type.h
+###  3.1. <a name='type.h'></a>type.h
 
-구현에 필요한 data structure들을 선언하는 파일이다.
+구현에 필요한 data structure들을 선언하는 파일이다. 
 
-### file.h
+###  3.2. <a name='file.h'></a>file.h
 
-file open/close를 위해 사용되는 함수를 wrapping한 macro들을 정의하는 파일이다.
+file.h 파일은 파일 open/close를 위한 wrapping 매크로들을 정의하는 파일이다. 이러한 매크로들은 파일 조작 과정을 단순화하여 코드의 가독성과 유지보수성을 높인다. 파일 조작을 매크로로 추상화함으로써 일관성을 유지하고 파일 처리에서의 오류 가능성을 줄인다. 
 
-### metadata.h/metadata.c
+###  3.3. <a name='metadata.hmetadata.c'></a>metadata.h/metadata.c
 
-드라이버의 작동을 위해서 필요한 `metadata`인 `data buffer address`, `map`, `freelist`, `dirtylist`를 저장하고 불러오는 API를 구현한 파일이다.
+`metadata.h`와 `metadata.c` 파일은 드라이버의 작동을 위해 필요한 메타데이터를 저장하고 불러오는 API를 구현한 파일이다. 메타데이터에는 `data buffer address`, `map`, `free list`, `dirty list`이 포함된다. 이 데이터들은 driver의 consistency를 위해서 반드시 보관되어야하므로 local에 저장되어 module init될 때 불러오고 exit될 때 저장되어야 한다. 이를 위해서 init과 	exit에서 메타데이터 저장하는 기능을 해당 파일에 구현하였다.
 
-### dev.c
+해당 파일의 핵심적인 함수는 다음과 같다.
 
-## test
+```c
+int initialize_memory(struct csl_device *dev);
+int initialize_metadata(struct csl_device *dev);
+int load_metadata(struct csl_device *dev, int reset_device);
+void save_metadata(struct csl_device *dev);
+```
 
+###  3.4. <a name='dev.c'></a>dev.c
 
+`dev.c` 파일은 디바이스 드라이버의 주요 기능을 구현하는 파일이다. 이 파일은 `read`, `write`, `garbage collecting`과 같은 기능을 드라이브 핵심 기능을 구현하고 있으며, 또한 `init`과 `exit`와 같이 드라이버의 생명주기를 관리하는 기능을 구현하고 있다.
 
-## Experiment
+해당 파일의 핵심적인 함수는 다음과 같다.
 
-### Random VS Sequential
+```c
+
+##  4. <a name='test'></a>test
+
+###  4.1. <a name='ReadWrite'></a>Read/Write
+
+###  4.2. <a name='SaveLoadMetadata'></a>Save/Load Metadata
+
+###  4.3. <a name='DisplayMapping'></a>Display Mapping
+
+###  4.4. <a name='Synchronization'></a>Synchronization
+
+##  5. <a name='Experiment'></a>Experiment
+
+###  5.1. <a name='RandomVSSequential'></a>Random VS Sequential
 
 본 프로그램 구현상으로는 `cache`와 같은 optimization이 없기 때문에 random이나 sequential이나 전부 동일한 translation 및 data access 과정을 거칠 수 밖에 없다. 그렇기에 device에서 이를 처리하는 과정에 대해서는 동일한 workload를 가질 것으로 예측하였다.
 
@@ -144,7 +202,7 @@ size=4MB
 
 실험결과 미세하게나마 sequential이 random보다 더 좋은 성능을 보이는 것을 확인할 수 있었다. 이는 드라이버의 구현상에서의 문제가 아니라 I/O Layer에서 request를 setting하는 과정에서 cache를 사용하여 최적화를 하고 있기에 발생하는 차이로 보인다. 대표적으로 `submit_fio`과정에서 `blk_mq_peek_cached_request`를 통해서 cache된 request가 있는지 확인하고 있다.
 
-### Read VS Write
+###  5.2. <a name='ReadVSWrite'></a>Read VS Write
 Read는 `Reader-Writer` lock의 특성상 다수의 Reader가 `critical section`에 접근할 수 있기 때문에 numjobs가 늘어나면 늘어날수록 read가 write에 비해서 더 좋은 성능을 보인다. 
 
 <p align="center">
@@ -156,9 +214,9 @@ Read는 `Reader-Writer` lock의 특성상 다수의 Reader가 `critical section`
 
 read의 경우에는 여러개의 reader가 동시에 접근할 수 있기 때문에 numjobs가 증가할수록 성능이 증가하는 것을 확인할 수 있었다. 그러나 write의 경우에는 1개의 writer만이 접근가능해야 하므로 numjobs가 증가하여도 1명의 writer만이 쓸 수 있으며 오히려 지나치게 많아지는 경우에는 `write lock`을 획득하는 과정에서 overhead가 과다하게 발생하기 때문에 numjobs=4 이후로는 성능이 감소하는 것을 확인할 수 있었다.
 
-## Improvement
+##  6. <a name='Improvement'></a>Improvement
 
-### Block size
+###  6.1. <a name='Blocksize'></a>Block size
 
 현재의 디바이스는 sector size와 동일한 512B 단위로 I/O를 수행하고 있다. 그러나 이는 지나치게 작은 단위이다. 디바이스가 request를 처리하는데 있어서는 크게 2개의 overhead가 발생한다. 첫번째는 `request`를 처리하기 위해서 lock을 잡거나 metadata를 처리하는 과정에서 발생하는 overhead고 나머지 하나는 실질적으로 데이터를 읽거나 쓰는 과정에서 발생하는 overhead이다. 첫번째 overhead의 경우에는 그 값이 고정되어있다. 그러나 두번째 overhead의 경우에는 데이터의 크기에 비례하게 증가한다. 따라서 데이터의 크기가 작을수록 이 첫번째 overhead가 전체 overhead의 비중이 커지게 된다. 이를 해결하기 위해서는 한번에 쓰는 데이터의 크기를 늘리는 것이 필요하다. 이를 통해 데이터의 크기가 overhead에 비해 상대적으로 커지게 되어 전체 overhead의 비중이 줄어들게 된다. 이를 통해 전체적인 성능을 향상시킬 수 있다.
 
@@ -189,17 +247,17 @@ Block Size가 커짐에 따라서 Bandwith가 4.5배 가량 증가하는 것을 
 
 그러나 주어진 sector의 크기를 변경할 수는 없다. 대신에 연속적인 sector를 묶어서 큰 단위의 I/O를 수행하는 방법을 고려해볼 수 있다. 이를 통해 sector size를 변경하지 않고도 큰 단위의 I/O를 수행할 수 있다. 이를 위해서는 연속적인 logical data가 physical data에서도 연속적으로 매핑되도록 하는 것이 필요하다.
 
-### Divide Lock
+###  6.2. <a name='DivideLock'></a>Divide Lock
 
 현재 write lock은 전체 memory에 대해서 exclusive lock을 사용하고 있다. 따라서 write가 일어나는 경우 전체 메모리는 write를 수행중인 thread에서만 접근이 가능한 상태가 된다. 그렇기에 write 연산에 대해서는 multi queue를 통한 병렬 처리의 성능이 제대로 활용되지 못하는 것이다. 이를 해결해기 위해서 write lock을 더 작은 단위로 나누어서 사용하는 방법을 고려해볼 수 있다. 전체 memory buffer를 여러 개의 작은 단위로 분할하여 각각의 작은 단위에 대해서 lock을 사용하는 방법이다. 이를 통해 write가 일어나는 경우 전체 memory가 lock되는 것이 아니라 일부 memory만 lock되는 것으로 변경할 수 있다. 이를 통해 한 구역에서 write lock이 발생하더라도 다른 구역은 별도의 작업을 수행할 수 있게 된다. 이를 통해 전체적인 성능을 향상시킬 수 있다.
 
-### Cache
+###  6.3. <a name='Cache'></a>Cache
 
 사전에 언급한 바와 같이 현재의 구현은 cache와 같은 optimization이 없다. 따라서 매번 요청이 들어올 때마다 metadata를 읽어오는 과정이 필요하다. 따라서 이러한 overhead를 줄이기 위해서는 cache를 도입하는 것도 고려해볼수 있다. cache를 도입함으로써 metadata를 더 빠르게 읽어올 수 있게 되고 이를 통해 전체적인 성능을 향상시킬 수 있을 것이다.
 
-## Discussion
+##  7. <a name='Discussion'></a>Discussion
 
-### Linked List of Linux
+###  7.1. <a name='LinkedListofLinux'></a>Linked List of Linux
 
 `linked list`는 linux에서 매우 많이 사용되는 자료구조이다. 그러나 전통적인 구현으로는 list를 사용하는 구조체마다 개별적인 list API를 가져야만 하였다. 그래서 linux에서는 이를 통합하여 강력한 list API를 제공하기 위해 `container_of`를 이용한 list 시스템을 구현하였다. `container_of`의 구현은 다음과 같다.
 
@@ -220,12 +278,12 @@ Block Size가 커짐에 따라서 Bandwith가 4.5배 가량 증가하는 것을 
 
 이러한 `container_of`와 `offsetof`를 통해서 linux는 구조체마다 개별적인 list 구현이 필요없이 강력한 list API를 제공할 수 있게 되었다.
 
-### kmalloc vs vmalloc
+###  7.2. <a name='kmallocvsvmalloc'></a>kmalloc vs vmalloc
 이 둘의 주요 차이점은, kmalloc은 가상/물리 메모리에 연속적인 방식으로 메모리를 할당한다. 그러나 kmalloc과 유사하게 작동하지만 가상 메모리에서는 연속적으로 할당하는 반면 물리 메모리에서는 그렇지 않다는 점이다.
 
 일반적으로 vmalloc은 물리 메모리가 아닌 가상 메모리에만 연속적으로 할당하므로 페이지 테이블에 여러 가상-물리 주소 매핑을 추가해야 하므로 커널의 성능이 더욱 느려질 수 있으므로 일반적으로는 vmalloc보다 kmalloc이 더 빠르다. 그러나 vmalloc은 물리 메모리가 연속적이지 않은 경우에도 메모리를 할당할 수 있기 때문에 더 큰 메모리 청크를 할당 할 수 있다는 장점이 있다.
 
-### Block Level I/O Layer
+###  7.3. <a name='BlockLevelIOLayer'></a>Block Level I/O Layer
 
 linux의 `Block Level I/O Layer`의 개괄은 다음과 같다.
 
@@ -367,7 +425,7 @@ F -->|multi request| H[rq_queue/Request Handler]
 G -->|single request| H
 ```
 
-### nr_hw_queues
+###  7.4. <a name='nr_hw_queues'></a>nr_hw_queues
 
 Block device에서 request가 전달되는 과정을 살펴보면 다음과 같다.
 
@@ -380,7 +438,7 @@ Block device에서 request가 전달되는 과정을 살펴보면 다음과 같�
 
 nr_hw_queue 변수는 위의 그림의 2번째 layer에 위치한 hardware dispatch queue의 개수를 결정하는 변수이다. 이 변수는 block device의 성능에 큰 영향을 미치는 변수이다. 이 변수가 클수록 block device는 더 많은 request를 동시에 처리할 수 있게 된다. 그러나 이 변수가 클수록 lock을 획득하는 overhead가 커지게 된다. linux 내부의 다른 block device driver(e.g. `nvme`, `scsi`)들은 이 변수를 어떻게 설정하고 있는지 확인해본 결과, `possible number of CPU`와 동일하게 설정하고 있는 것을 확인할 수 있었다. 이에 따라 본 드라이버에서는 `num_possible_cpus()`를 이용하여 `nr_hw_queues`를 `CPU`의 개수와 동일하게 설정하였다.
 
-### Semaphore vs Mutex
+###  7.5. <a name='SemaphorevsMutex'></a>Semaphore vs Mutex
 사실상 대부분의 core 부분의 개발이 끝난 이후에 가장 문제가 되었던 부분이다. 본 드라이버의 동기화 상황은 `Reader-Writer` case에 속한다. 이는 굉장히 유명한 경우이며 학부 수업에서도 대표적인 예제로서 다룬 바 있다. 그렇기에 수업에서 배웠던 `Semaphore`를 이용하여 이를 해결하고자 하였다. 처음에 시도하였던 동기화 구조는 다음과 같다.
 
 ```c
@@ -466,7 +524,7 @@ static void write_sector(...)
 ```
 수행결과 `rwlock`을 사용하였을 때, `Mutex`를 사용하였을 때보다 1.5배 가량 성능향상이 있는 것을 확인할 수 있었다.
 
-### Additional Mutex
+###  7.6. <a name='AdditionalMutex'></a>Additional Mutex
 linux의 `mutex`는 다음과 같이 정의되어 있다.
 ```c
 struct mutex {
@@ -600,7 +658,7 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
 ```
 `slow path`에서도 다시 `mid path`와 `slow path`로 나눠서 동작한다. `mid path`는 `spinlock`을 사용하여 `mutex`를 해제하는 과정이다. 이과정이 실패하게 되면 `mutex`는 `slow path`로 진입하게 된다. `slow path`는 `sleeplock`을 사용하여 `mutex`를 해제하는 과정이다. `slow path`는 전통적인 `sleep lock`의 해제 방법을 사용한다. 이를 통해 `mutex`를 해제하고 `wait_list`에 있는 `task`를 깨우는 과정을 거친다.
 
-### rwlock in linux
+###  7.7. <a name='rwlockinlinux'></a>rwlock in linux
 `Reader-Writer`패턴은 매우 일반적인 synchronize 패턴이다. 리눅스에서는 이 패턴에 대해서 대응하기 위해 `rwlock_t`과 `rw_semaphore`라는 두 가지 lock을 제공하고 있다. 이 두 lock의 차이점은 결국 `spinlock`과 `sleeplock`의 차이이다. `rwlock_t`의 경우에는 `spinlock`을 사용하여 구현한 반면에 `sleeplock`은 근본적으로 `semaphore`를 이용하여 구현하였기에 `sleeplock`에 속한다.
 
 <a name="footnote_1">1</a>: https://junsoolee.gitbook.io/linux-insides-ko/summary/syncprim/linux-sync-4
