@@ -45,17 +45,81 @@ void read_data(int fd, off_t offset, void *data, size_t size) {
     fsync(fd);
 }
 
-void *test_device(void *threadarg) {
+void print_test_result(const char *test_name, int success) {
+    if (success) {
+        printf("\033[0;32m[✔] %s passed\033[0m\n", test_name);
+    } else {
+        printf("\033[0;31m[✘] %s failed\033[0m\n", test_name);
+    }
+}
+
+void single_thread_write_test(int fd) {
+    char *write_buffer;
+
+    if (posix_memalign((void **)&write_buffer, SECTOR_SIZE, SECTOR_SIZE)) {
+        perror("posix_memalign");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    memset(write_buffer, 0xAA, SECTOR_SIZE);
+
+    int success = 1;
+    for (int i = 0; i < NUM_SECTORS; i++) {
+        off_t offset = i * SECTOR_SIZE;
+        write_data(fd, offset, write_buffer, SECTOR_SIZE);
+    }
+
+    print_test_result("Single thread write test", success);
+    free(write_buffer);
+}
+
+void single_thread_read_test(int fd) {
+    char *write_buffer;
+    char *read_buffer;
+
+    if (posix_memalign((void **)&write_buffer, SECTOR_SIZE, SECTOR_SIZE)) {
+        perror("posix_memalign");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (posix_memalign((void **)&read_buffer, SECTOR_SIZE, SECTOR_SIZE)) {
+        perror("posix_memalign");
+        free(write_buffer);
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    memset(write_buffer, 0xAA, SECTOR_SIZE);
+
+    int success = 1;
+    for (int i = 0; i < NUM_SECTORS; i++) {
+        off_t offset = i * SECTOR_SIZE;
+        memset(read_buffer, 0, SECTOR_SIZE);
+        read_data(fd, offset, read_buffer, SECTOR_SIZE);
+
+        if (memcmp(write_buffer, read_buffer, SECTOR_SIZE) != 0) {
+            success = 0;
+            fprintf(stderr, "Data verification failed at offset %ld in single thread\n", offset);
+            break;
+        }
+    }
+
+    print_test_result("Single thread read test", success);
+    free(write_buffer);
+    free(read_buffer);
+}
+
+void *multithread_test_device(void *threadarg) {
     thread_data_t *data = (thread_data_t *)threadarg;
     int fd = data->fd;
     int thread_id = data->thread_id;
     pthread_mutex_t *mutex = data->mutex;
 
-    // Allocate buffers for write and read
     char *write_buffer;
     char *read_buffer;
 
-    // posix_memalign to ensure alignment for O_DIRECT
     if (posix_memalign((void **)&write_buffer, SECTOR_SIZE, SECTOR_SIZE)) {
         perror("posix_memalign");
         close(fd);
@@ -69,40 +133,32 @@ void *test_device(void *threadarg) {
         pthread_exit(NULL);
     }
 
-    // Fill write buffer with test data
     memset(write_buffer, 0xAA + thread_id, SECTOR_SIZE);
 
-    // Write and read data with synchronization
+    int success = 1;
     for (int i = 0; i < NUM_SECTORS; i++) {
         off_t offset = i * SECTOR_SIZE;
 
-        // Lock the mutex before entering the critical section
         pthread_mutex_lock(mutex);
 
-        // Write data to device
         write_data(fd, offset, write_buffer, SECTOR_SIZE);
 
-        // Read data back
         memset(read_buffer, 0, SECTOR_SIZE);
         read_data(fd, offset, read_buffer, SECTOR_SIZE);
 
-        // Verify data
         if (memcmp(write_buffer, read_buffer, SECTOR_SIZE) != 0) {
+            success = 0;
             fprintf(stderr, "Data verification failed at offset %ld in thread %d\n", offset, thread_id);
-            free(write_buffer);
-            free(read_buffer);
-            close(fd);
-            pthread_mutex_unlock(mutex);  // Unlock the mutex before exiting
-            pthread_exit(NULL);
+            break;
         }
 
-        // Unlock the mutex after exiting the critical section
         pthread_mutex_unlock(mutex);
     }
 
-    printf("Thread %d: All tests passed successfully!\n", thread_id);
+    char test_name[50];
+    snprintf(test_name, sizeof(test_name), "Multithread test in thread %d", thread_id);
+    print_test_result(test_name, success);
 
-    // Free allocated memory and close file descriptor
     free(write_buffer);
     free(read_buffer);
 
@@ -120,12 +176,14 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // Create threads
+    single_thread_write_test(fd);
+    single_thread_read_test(fd);
+
     for (int i = 0; i < NUM_THREADS; i++) {
         thread_data[i].thread_id = i;
         thread_data[i].fd = fd;
         thread_data[i].mutex = &mutex;
-        int rc = pthread_create(&threads[i], NULL, test_device, (void *)&thread_data[i]);
+        int rc = pthread_create(&threads[i], NULL, multithread_test_device, (void *)&thread_data[i]);
         if (rc) {
             fprintf(stderr, "Error: Unable to create thread %d, %d\n", i, rc);
             close(fd);
@@ -133,7 +191,6 @@ int main() {
         }
     }
 
-    // Wait for all threads to complete
     for (int i = 0; i < NUM_THREADS; i++) {
         pthread_join(threads[i], NULL);
     }

@@ -8,6 +8,7 @@
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <linux/xarray.h>
+#include <linux/spinlock.h>
 
 #include "file.h"
 #include "metadata.h"
@@ -22,7 +23,7 @@
 		mutex_lock(&dev->rw_mutex); \
 	mutex_unlock(&dev->reader_cnt_mutex);
 #define RELEASE_READ_LOCK(dev)                \
-	mutex_lock(&dev->reader_cnt_mutex);   \
+	mutex_lock(&dev->reader_cnt_mutex);    \
 	dev->reader_nr--;                     \
 	if (dev->reader_nr == 0)              \
 		mutex_unlock(&dev->rw_mutex); \
@@ -30,20 +31,25 @@
 #define GET_WRITE_LOCK(dev) mutex_lock(&dev->rw_mutex);
 #define RELEASE_WRITE_LOCK(dev) mutex_unlock(&dev->rw_mutex);
 #elif _USE_SEMAPHORE
-#define GET_READ_LOCK(dev)            \
-	down(&dev->reader_cnt_mutex); \
-	dev->reader_nr++;             \
-	if (dev->reader_nr == 1)      \
-		down(&dev->rw_mutex); \
+#define GET_READ_LOCK(dev)                 \
+	down(&dev->reader_cnt_mutex);      \
+	dev->reader_nr++;                  \
+	if (dev->reader_nr == 1)           \
+		down(&dev->rw_mutex);      \
 	up(&dev->reader_cnt_mutex);
-#define RELEASE_READ_LOCK(dev)        \
-	down(&dev->reader_cnt_mutex); \
-	dev->reader_nr--;             \
-	if (dev->reader_nr == 0)      \
-		up(&dev->rw_mutex);   \
+#define RELEASE_READ_LOCK(dev)             \
+	down(&dev->reader_cnt_mutex);      \
+	dev->reader_nr--;                  \
+	if (dev->reader_nr == 0)           \
+		up(&dev->rw_mutex);        \
 	up(&dev->reader_cnt_mutex);
 #define GET_WRITE_LOCK(dev) down(&dev->rw_mutex);
 #define RELEASE_WRITE_LOCK(dev) up(&dev->rw_mutex);
+#elif _USE_RWSEMAPHORE
+#define GET_READ_LOCK(dev) down_read(&dev->rw_mutex);
+#define RELEASE_READ_LOCK(dev) up_read(&dev->rw_mutex);
+#define GET_WRITE_LOCK(dev) down_write(&dev->rw_mutex);
+#define RELEASE_WRITE_LOCK(dev) up_write(&dev->rw_mutex);
 #else
 #define GET_READ_LOCK(dev) read_lock(&dev->rwlock);
 #define RELEASE_READ_LOCK(dev) read_unlock(&dev->rwlock);
@@ -67,6 +73,7 @@ static int dev_major = 0;
 /* Pointer to the device structure */
 static struct csl_device* dev = NULL;
 
+
 /* Function to open the block device */
 static int dev_open(struct gendisk* disk, blk_mode_t mode) {
 	pr_info("%sdevice open\n", PROMPT);
@@ -87,29 +94,6 @@ static void dev_release(struct gendisk* disk) {
 /* Block device operations structure */
 static struct block_device_operations csl_dev_ops = {
     .owner = THIS_MODULE, .open = dev_open, .release = dev_release};
-
-/**
- * print_metadata - Print metadata
- *
- * @dev: Device pointer
- */
-static void print_metadata(struct csl_device* dev) {
-	unsigned long idx;
-	struct sector_mapping_entry* ptr;
-	pr_info("%sBlock Map\n", PROMPT);
-
-	pr_info("|--------------------------------------------|\n");
-	pr_info("| Logical Block Index | Phyiscal Block Index |\n");
-	pr_info("|---------------------|----------------------|\n");
-	xa_for_each(&dev->map, idx, ptr)
-	    pr_info("| %-19d | %20d |\n", ptr->l_idx, ptr->p_idx);
-	pr_info("|--------------------------------------------|\n");
-
-	pr_info("%sFree Block Count: %ld\n", PROMPT,
-		list_count_nodes(&dev->freelist));
-	pr_info("%sDirty Block Count: %ld\n", PROMPT,
-		list_count_nodes(&dev->dirtylist));
-}
 
 /**
  * garbage_collecting - Garbage collecting
@@ -360,12 +344,18 @@ static int __init csl_driver_init(void) {
 	mutex_init(&dev->reader_cnt_mutex);
 	mutex_init(&dev->rw_mutex);
 	dev->reader_nr = 0;
+	pr_info("%sUsing mutex\n", PROMPT);
 #elif _USE_SEMAPHORE
 	sema_init(&dev->reader_cnt_mutex, 1);
 	sema_init(&dev->rw_mutex, 1);
 	dev->reader_nr = 0;
+	pr_info("%sUsing semaphore\n", PROMPT);
+#elif _USE_RWSEMAPHORE
+	init_rwsem(&dev->rw_mutex);
+	pr_info("%sUsing rw_semaphore\n", PROMPT);
 #else
 	rwlock_init(&dev->rwlock);
+	pr_info("%sUsing rwlock\n", PROMPT);
 #endif
 	xa_init(&dev->map);
 	INIT_LIST_HEAD(&dev->freelist);

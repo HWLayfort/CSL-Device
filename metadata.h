@@ -36,6 +36,8 @@
     entry->l_idx = __l_idx; \
     entry->p_idx = __p_idx;
 
+void print_metadata(struct csl_device* dev); 
+
 int load_ptr(struct file *file, void **ptr);
 int save_ptr(struct file *file, void *ptr);
 int load_list(struct file *file, struct list_head *list);

@@ -1,4 +1,4 @@
-# CSL Report 2 - Append Only Ramdisk
+# CSL Report 2 - Append Only Virtual Block Storage Device
 
 * 1. [Data Structure](#DataStructure)
 	* 1.1. [Device](#Device)
@@ -16,9 +16,9 @@
 	* 3.4. [dev.c](#dev.c)
 * 4. [test](#test)
 	* 4.1. [Read/Write](#ReadWrite)
-	* 4.2. [Save/Load Metadata](#SaveLoadMetadata)
-	* 4.3. [Display Mapping](#DisplayMapping)
-	* 4.4. [Synchronization](#Synchronization)
+	* 4.2. [Synchronization](#Synchronization)
+	* 4.3. [Save/Load Metadata](#SaveLoadMetadata)
+	* 4.4. [Display Mapping](#DisplayMapping)
 * 5. [Experiment](#Experiment)
 	* 5.1. [Random VS Sequential](#RandomVSSequential)
 	* 5.2. [Read VS Write](#ReadVSWrite)
@@ -159,17 +159,229 @@ void save_metadata(struct csl_device *dev);
 
 ##  4. <a name='test'></a>test
 
+종합적인 test를 위해서 testcode를 구현하였다. 처음에는 ubuntu c에서는 `O_DIRECT` flag를 사용할 수 없어서 `rust`를 사용하여 test를 진행하였다. 그러나 이후 `GNU C`에서는 `O_DIRECT` flag를 사용할 수 있음을 확인하였다. 따라서 이후 test는 `GNU C`를 사용하여 진행하였다.
+
+```c
+#define DEBUG_MESSAGE(fmt, ...) \
+	if (IS_ENABLED(DEBUG))  \
+		printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
+```
+위와 같이 `DEBUG` option이 define된 경우에만 출력하는 매크로를 이용하여 동작여부를 확인하였다. 또한 `__reset_device`라는 parameter를 만들어서 필요에 따라 device의 모든 data를 초기화시킬 수 있도록 하였다.
+
 ###  4.1. <a name='ReadWrite'></a>Read/Write
 
-###  4.2. <a name='SaveLoadMetadata'></a>Save/Load Metadata
+가장 먼저 디바이스에 대해서 `read`와 `write`를 수행하는 테스트를 진행하였다. 이를 통해서 디바이스가 정상적으로 동작하는지 확인하였다.
 
-###  4.3. <a name='DisplayMapping'></a>Display Mapping
+이를 위해서 사용한 C 코드는 다음과 같다.
 
-`dev.c`에 메타데이터의 정합성을 디버깅하기 위해서 `map`, `freelist`, `dirtylist`의 정보를 출력하는 함수인 `print_metadata`함수를 구현하였다. 해당 함수는 `map` 데이터를 table 형태로 출력하고, `freelist`와 `dirtylist`는 현재 저장된 데이터의 갯수만을 출력한다.
+```c
+void write_data(int fd, off_t offset, const void *data, size_t size) {
+    if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
+        perror("lseek");
+        exit(EXIT_FAILURE);
+    }
+    if (write(fd, data, size) != size) {
+        perror("write");
+        exit(EXIT_FAILURE);
+    }
 
-###  4.4. <a name='Synchronization'></a>Synchronization
+    fsync(fd);
+}
 
-`Synchronization`
+void read_data(int fd, off_t offset, void *data, size_t size) {
+    if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
+        perror("lseek");
+        exit(EXIT_FAILURE);
+    }
+    if (read(fd, data, size) != size) {
+        perror("read");
+        exit(EXIT_FAILURE);
+    }
+
+    fsync(fd);
+}
+
+void print_test_result(const char *test_name, int success) {
+    if (success) {
+        printf("\033[0;32m[✔] %s passed\033[0m\n", test_name);
+    } else {
+        printf("\033[0;31m[✘] %s failed\033[0m\n", test_name);
+    }
+}
+
+void single_thread_write_test(int fd) {
+    char *write_buffer;
+
+    if (posix_memalign((void **)&write_buffer, SECTOR_SIZE, SECTOR_SIZE)) {
+        perror("posix_memalign");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    memset(write_buffer, 0xAA, SECTOR_SIZE);
+
+    int success = 1;
+    for (int i = 0; i < NUM_SECTORS; i++) {
+        off_t offset = i * SECTOR_SIZE;
+        write_data(fd, offset, write_buffer, SECTOR_SIZE);
+    }
+
+    print_test_result("Single thread write test", success);
+    free(write_buffer);
+}
+
+void single_thread_read_test(int fd) {
+    char *write_buffer;
+    char *read_buffer;
+
+    if (posix_memalign((void **)&write_buffer, SECTOR_SIZE, SECTOR_SIZE)) {
+        perror("posix_memalign");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (posix_memalign((void **)&read_buffer, SECTOR_SIZE, SECTOR_SIZE)) {
+        perror("posix_memalign");
+        free(write_buffer);
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    memset(write_buffer, 0xAA, SECTOR_SIZE);
+
+    int success = 1;
+    for (int i = 0; i < NUM_SECTORS; i++) {
+        off_t offset = i * SECTOR_SIZE;
+        memset(read_buffer, 0, SECTOR_SIZE);
+        read_data(fd, offset, read_buffer, SECTOR_SIZE);
+
+        if (memcmp(write_buffer, read_buffer, SECTOR_SIZE) != 0) {
+            success = 0;
+            fprintf(stderr, "Data verification failed at offset %ld in single thread\n", offset);
+            break;
+        }
+    }
+
+    print_test_result("Single thread read test", success);
+    free(write_buffer);
+    free(read_buffer);
+}
+```
+
+먼저 `dev/csl`을 direct I/O를 수행하기 위해서 `O_DIRECT` flag를 사용하여 open하고, 이후 `write`와 `read`를 수행하는 코드이다. 이를 통해서 디바이스가 정상적으로 동작하는지 확인하였다.
+
+해당 test를 수행한 이후 kernel log는 다음과 같다.
+
+<p align="center">
+ <img src = "images/WriteTest.png">
+</p>
+
+정상적으로 logic address와 physical address가 mapping되는 것을 확인할 수 있었다.
+
+fio에 대해서는 다음과 같은 테스트를 진행했다.
+```ini
+[global]
+bs=512
+iodepth=1
+direct=1
+ioengine=libaio
+filename=/dev/csl
+group_reporting=1
+numjobs=1
+size=16MB
+```
+
+이는 device에 대해서 16MB의 데이터를 512B 단위로 sequential write를 수행하는 테스트이다. 이를 통해서 device 전체에 대해서 write가 정상적으로 수행되는지 확인하였다. 수행결과 이상없이 프로그램이 동작하는 것을 확인할 수 있었다.
+
+###  4.2. <a name='Synchronization'></a>Synchronization
+
+다음으로는 `synchronization`에 대한 테스트를 진행하였다. 본 디바이스는 `Reader-Writer` lock을 사용하여 동시에 여러개의 reader가 접근할 수 있도록 하였다. 이를 확인하기 위해서 `Reader-Writer` lock을 사용하여 동시에 여러개의 reader가 접근할 수 있는지 확인하였다.
+
+이를 위해서 사용한 코드는 다음과 같다.
+
+```c
+void *multithread_test_device(void *threadarg) {
+    thread_data_t *data = (thread_data_t *)threadarg;
+    int fd = data->fd;
+    int thread_id = data->thread_id;
+    pthread_mutex_t *mutex = data->mutex;
+
+    char *write_buffer;
+    char *read_buffer;
+
+    if (posix_memalign((void **)&write_buffer, SECTOR_SIZE, SECTOR_SIZE)) {
+        perror("posix_memalign");
+        close(fd);
+        pthread_exit(NULL);
+    }
+
+    if (posix_memalign((void **)&read_buffer, SECTOR_SIZE, SECTOR_SIZE)) {
+        perror("posix_memalign");
+        free(write_buffer);
+        close(fd);
+        pthread_exit(NULL);
+    }
+
+    memset(write_buffer, 0xAA + thread_id, SECTOR_SIZE);
+
+    int success = 1;
+    for (int i = 0; i < NUM_SECTORS; i++) {
+        off_t offset = i * SECTOR_SIZE;
+
+        pthread_mutex_lock(mutex);
+
+        write_data(fd, offset, write_buffer, SECTOR_SIZE);
+
+        memset(read_buffer, 0, SECTOR_SIZE);
+        read_data(fd, offset, read_buffer, SECTOR_SIZE);
+
+        if (memcmp(write_buffer, read_buffer, SECTOR_SIZE) != 0) {
+            success = 0;
+            fprintf(stderr, "Data verification failed at offset %ld in thread %d\n", offset, thread_id);
+            break;
+        }
+
+        pthread_mutex_unlock(mutex);
+    }
+
+    char test_name[50];
+    snprintf(test_name, sizeof(test_name), "Multithread test in thread %d", thread_id);
+    print_test_result(test_name, success);
+
+    free(write_buffer);
+    free(read_buffer);
+
+    pthread_exit(NULL);
+}
+```
+
+이 코드는 `pthread`를 사용하여 여러개의 thread가 동시에 device에 접근하는 것을 테스트하는 코드이다. 이를 통해서 `Reader-Writer` lock이 정상적으로 동작하는지 확인하였다. 수행결과 이상없이 프로그램이 동작하는 것을 확인할 수 있었다.
+
+###  4.3. <a name='SaveLoadMetadata'></a>Save/Load Metadata
+
+본 디바이스는 data consistency를 위해서 metadata를 저장하고 불러오는 기능을 구현하였다. 이를 확인하기 위해서 디버깅 모드에서는 metadata를 불러왔을 때 해당 정보를 출력하도록 하였다. 이를 통해서 metadata가 정상적으로 저장되고 불러와지는지 확인하였다.
+
+먼저 read/write를 수행한 후의 device의 metadata를 출력한 결과는 다음과 같다.
+
+<p align="center">
+ <img src = "images/AfterTest.png">
+</p>
+
+이후, device를 unload한 후 다시 load한 후의 kernel log는 다음과 같다.
+
+<p align="center">
+ <img src = "images/MetadataLoad.png">
+</p>
+
+확인결과 metadata가 정상적으로 저장되고 불러와지는 것을 확인할 수 있었다.
+
+###  4.4. <a name='DisplayMapping'></a>Display Mapping
+
+`dev.c`에 메타데이터의 정합성을 디버깅하기 위해서 `map`, `freelist`, `dirtylist`의 정보를 출력하는 함수인 `print_metadata`함수를 구현하였다. 해당 함수는 `map` 데이터를 table 형태로 출력하고, `freelist`와 `dirtylist`는 현재 저장된 데이터의 갯수만을 출력한다. 실행 결과는 다음과 같다.
+
+<p align="center">
+ <img src = "images/DisplayMapping.png">
+</p>
 
 ##  5. <a name='Experiment'></a>Experiment
 
@@ -200,7 +412,7 @@ size=4MB
  Image 4. Random VS Sequential Comparison
 </p>
 
-실험결과 미세하게나마 sequential이 random보다 더 좋은 성능을 보이는 것을 확인할 수 있었다. 이는 드라이버의 구현상에서의 문제가 아니라 I/O Layer에서 request를 setting하는 과정에서 cache를 사용하여 최적화를 하고 있기에 발생하는 차이로 보인다. 대표적으로 `submit_fio`과정에서 `blk_mq_peek_cached_request`를 통해서 cache된 request가 있는지 확인하고 있다.
+실험결과 미세하게나마 sequential이 random보다 더 좋은 성능을 보이는 것을 확인할 수 있었다. 이는 드라이버의 구현상에서의 문제가 아니라 I/O Layer에서 request를 setting하는 과정에서 cache를 사용하여 최적화를 하고 있기에 발생하는 차이로 보인다. 대표적으로 `submit_bio`함수에서 `bio`를 `request`로 변환해서 `request_queue`로 전달하는 과정에서 `blk_mq_peek_cached_request`를 통해서 cache된 `request`가 있는지 확인하는 optimization이 있다.
 
 ###  5.2. <a name='ReadVSWrite'></a>Read VS Write
 Read는 `Reader-Writer` lock의 특성상 다수의 Reader가 `critical section`에 접근할 수 있기 때문에 numjobs가 늘어나면 늘어날수록 read가 write에 비해서 더 좋은 성능을 보인다. 
@@ -256,6 +468,8 @@ Block Size가 커짐에 따라서 Bandwith가 4.5배 가량 증가하는 것을 
 사전에 언급한 바와 같이 현재의 구현은 cache와 같은 optimization이 없다. 따라서 매번 요청이 들어올 때마다 metadata를 읽어오는 과정이 필요하다. 따라서 이러한 overhead를 줄이기 위해서는 cache를 도입하는 것도 고려해볼수 있다. cache를 도입함으로써 metadata를 더 빠르게 읽어올 수 있게 되고 이를 통해 전체적인 성능을 향상시킬 수 있을 것이다.
 
 ##  7. <a name='Discussion'></a>Discussion
+
+해당 부분은 본 프로젝트를 진행하면서 알게된 linux의 다양한 기능들에 대해서 다루고자 한다. 이를 통해서 linux의 다양한 기능들에 대해서 이해하고 이를 통해 성능을 향상시킬 수 있는 방법에 대해서 고민해보고자 한다.
 
 ###  7.1. <a name='LinkedListofLinux'></a>Linked List of Linux
 
@@ -424,6 +638,9 @@ C -->|single request| H
 F -->|multi request| H[rq_queue/Request Handler]
 G -->|single request| H
 ```
+<p align="center" style="font-size:125%">
+ Fig 1. Block Device Request Handling Flowchart
+</p>
 
 ###  7.4. <a name='nr_hw_queues'></a>nr_hw_queues
 
@@ -433,7 +650,7 @@ Block device에서 request가 전달되는 과정을 살펴보면 다음과 같�
  <img src = "images/HWQueue.png">
 </p>
 <p align="center" style="font-size:125%">
- Image 5. Hardware Queue Structure
+ Image 8. Hardware Queue Structure
 </p>
 
 nr_hw_queue 변수는 위의 그림의 2번째 layer에 위치한 hardware dispatch queue의 개수를 결정하는 변수이다. 이 변수는 block device의 성능에 큰 영향을 미치는 변수이다. 이 변수가 클수록 block device는 더 많은 request를 동시에 처리할 수 있게 된다. 그러나 이 변수가 클수록 lock을 획득하는 overhead가 커지게 된다. linux 내부의 다른 block device driver(e.g. `nvme`, `scsi`)들은 이 변수를 어떻게 설정하고 있는지 확인해본 결과, `possible number of CPU`와 동일하게 설정하고 있는 것을 확인할 수 있었다. 이에 따라 본 드라이버에서는 `num_possible_cpus()`를 이용하여 `nr_hw_queues`를 `CPU`의 개수와 동일하게 설정하였다.
@@ -522,7 +739,52 @@ static void write_sector(...)
 	write_unlock(&dev->rwlock);
 }
 ```
-수행결과 `rwlock`을 사용하였을 때, `Mutex`를 사용하였을 때보다 1.5배 가량 성능향상이 있는 것을 확인할 수 있었다.
+
+구체적인 성능차이에 대해서 비교해보도록 하겠다. fio를 통해서 `read`, `write`, `readwrite`에 대한 성능을 비교해보았다. 테스트 환경은 다음과 같다.
+
+```ini
+[global]
+bs=512
+iodepth=16
+direct=1
+ioengine=libaio
+filename=/dev/csl
+group_reporting=1
+time_based=1
+runtime=10
+numjobs=8
+size=4MB
+```
+
+먼저 `read`에 대한 성능을 살펴보면 다음과 같다.
+<p align="center">
+ <img src = "images/SyncRead.png">
+</p>
+<p align="center" style="font-size:125%">
+ Image 9. Synchronization Read Performance Comparison
+</p>
+
+예상대로 `semaphore`를 사용하였을 때 성능이 급격히 하락하는 것을 관측할 수 있었다. `mutex`를 사용하였을 때는 `semaphore`정도로 차이가 급격하지는 않았으나 `rwlock`이나 `rw semaphore`에 비해서 대략 1.5배 가량의 차이를 보였다. 이는 `mutex`가 가지고 있는 optimization에 의해서 생기는 overload로 발생한 문제로 추측된다. `rwlock`과 `rw semaphore`의 경우에는 `Reader-Writer` 패턴에 특화된 lock이기 때문에 이러한 optimization이 되어있는 것으로 추측된다. 개중에서는 `rwlock`이 미세하게 더 좋은 성능을 보였다.
+
+다음으로 `write`에 대한 성능을 살펴보면 다음과 같다.
+<p align="center">
+ <img src = "images/SyncWrite.png">
+</p>
+<p align="center" style="font-size:125%">
+ Image 10. Synchronization Write Performance Comparison
+</p>
+
+`read`와 마찬가지로 `semaphore`가 압도적으로 나쁜 성능을 보였고 `mutex`가 중간 정도의 성능을 보였으며 `rwlock`과 `rw semaphore`이 가장 좋은 성능을 보였다. 그러나 `mutex`와 `rwlock`/`rw semaphore`의 성능차이가 `read`에 비해서 감소하는 것을 볼 수 있었는데, 이는 `write`의 경우에는 mutual exclusion을 반드시 보장해야 하기 때문에 `mutex`의 lock을 잡는데 걸리는 시간이 `read`에 비해서 덜 중요하게 작용하여 발생한 것으로 추측된다.
+
+마지막으로 전반적인 I/O에 대한 성능을 살펴보면 다음과 같다.
+<p align="center">
+ <img src = "images/SyncIO.png">
+</p>
+<p align="center" style="font-size:125%">
+ Image 11. Synchronization I/O Performance Comparison
+</p>
+
+`read`와 `write`의 성능을 종합한 결과이다. 기존의 `read`와 `write`의 결과와 마찬가지로 `semaphore`가 가장 나쁜 성능을 보이고 `mutex`가 중간 정도의 성능을 보였으며 `rwlock`이 가장 좋은 성능을 보인 것은 동일하지만 `rw semaphore`의 경우에는 `rwlock`에 비해서 성능이 확연히 감소하여 `mutex`와 비슷한 수준으로 떨어지는 것을 확인할 수 있었다. 이에 대한 자세한 논의는 `rwlock`과 `rw semaphore`에 대한 [Discussion](#rwlockinlinux)에서 다루도록 하겠다.
 
 ###  7.6. <a name='AdditionalMutex'></a>Additional Mutex
 linux의 `mutex`는 다음과 같이 정의되어 있다.
@@ -659,6 +921,272 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
 `slow path`에서도 다시 `mid path`와 `slow path`로 나눠서 동작한다. `mid path`는 `spinlock`을 사용하여 `mutex`를 해제하는 과정이다. 이과정이 실패하게 되면 `mutex`는 `slow path`로 진입하게 된다. `slow path`는 `sleeplock`을 사용하여 `mutex`를 해제하는 과정이다. `slow path`는 전통적인 `sleep lock`의 해제 방법을 사용한다. 이를 통해 `mutex`를 해제하고 `wait_list`에 있는 `task`를 깨우는 과정을 거친다.
 
 ###  7.7. <a name='rwlockinlinux'></a>rwlock in linux
-`Reader-Writer`패턴은 매우 일반적인 synchronize 패턴이다. 리눅스에서는 이 패턴에 대해서 대응하기 위해 `rwlock_t`과 `rw_semaphore`라는 두 가지 lock을 제공하고 있다. 이 두 lock의 차이점은 결국 `spinlock`과 `sleeplock`의 차이이다. `rwlock_t`의 경우에는 `spinlock`을 사용하여 구현한 반면에 `sleeplock`은 근본적으로 `semaphore`를 이용하여 구현하였기에 `sleeplock`에 속한다.
+`Reader-Writer`패턴은 매우 일반적인 synchronize 패턴이다. 리눅스에서는 이 패턴에 대해서 대응하기 위해 `rwlock_t`과 `rw_semaphore`라는 두 가지 구조체를 제공한다. 이 두 구조체는 `Reader-Writer` 패턴에 대한 동기화를 위해 사용된다. 먼저 `rwlock_t`에 대해서 살펴보자.
+
+`rwlock_t`는 다음과 같이 정의되어 있다.
+
+```c
+typedef struct {
+	arch_rwlock_t raw_lock;
+#ifdef CONFIG_DEBUG_SPINLOCK
+	unsigned int magic, owner_cpu;
+	void *owner;
+#endif
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	struct lockdep_map dep_map;
+#endif
+} rwlock_t;
+```
+
+각종 디버깅 옵션을 제외하고는 `arch_rwlock_t`가 `rwlock_t`의 핵심이다. `arch_rwlock_t`는 아키텍처에 따라 다르게 정의되어 있다. `arch_rwlock_t`는 현재 시스템의 아키텍처에 따라 다르게 정의되어 있다. 현재 본인의 환경인 x86의 경우에는 별도로 `arch_rwlock_t`가 정의되어 있지 않다. 대신 `include/asm-generic/qrwlock_types.h`에 정의되어있는 `arch_rwlock_t`를 사용하고 있다. 이는 다음과 같이 정의되어 있다.
+
+```c
+typedef struct qrwlock {
+	union {
+		atomic_t cnts;
+		struct {
+#ifdef __LITTLE_ENDIAN
+			u8 wlocked;	/* Locked for write? */
+			u8 __lstate[3];
+#else
+			u8 __lstate[3];
+			u8 wlocked;	/* Locked for write? */
+#endif
+		};
+	};
+	arch_spinlock_t		wait_lock;
+} arch_rwlock_t;
+```
+
+특징적인 것은 내부에 존재하는 `union` 구조체이다. 이 구조체는 `Reader`의 수를 나타내는 `cnts`와 `wlocked`와 `__lstate`로 구성된 구조체를 `union`으로 묶어서 같은 메모리 공간을 사용하도록 구성하고 있다. `atomic_t`가 실질적으로는 `int`의 크기와 동일하다는 것을 고려한다면 `wlocked`와 `__lstate`는 `cnt`를 4부분으로 나누어 각각의 부분에 접근할 수 있는 변수임을 알 수 있다. 이러한 구조가 어떻게 사용되는지는 `rwlock`의 API를 통해 살펴보도록 하겠다.
+
+`rwlock`의 API는 아키텍처에 독립적으로 존재해야하나 그 구현은 아키텍처에 의존적이다. 따라서 굉장히 복잡하게 얽혀있어서 이를 분석하는 것이 어려웠으나 `x86`의 경우에는 `qrwlock.h`에 존재하는 `qrwlock API`가 가장 핵심적인 부분이라고 할 수 있다. 이 API는 다음과 같이 정의되어 있다. 일단 `read lock`과 관련된 API만 살펴보도록 하겠다.
+```c
+static inline void queued_read_lock(struct qrwlock *lock)
+{
+	int cnts;
+
+	cnts = atomic_add_return_acquire(_QR_BIAS, &lock->cnts);
+	if (likely(!(cnts & _QW_WMASK)))
+		return;
+
+	/* The slowpath will decrement the reader count, if necessary. */
+	queued_read_lock_slowpath(lock);
+}
+
+static inline void queued_read_unlock(struct qrwlock *lock)
+{
+	/*
+	 * Atomically decrement the reader count
+	 */
+	(void)atomic_sub_return_release(_QR_BIAS, &lock->cnts);
+}
+```
+여기서 주목활 부분은 `atomic_add_return_acquire`이다. 이 함수의 prototype은 다음과 같다.
+```c
+atomic_add_return(int i, atomic_t *v)
+```
+이 함수의 역할은 `atomic_t` 포인터 `v`의 값을 `@v`에서 `(@v + @i)` atomic하게 업데이트 해주는 것이다. 이후에 업데이트한 값을 반환한다. 그렇다면 이 함수는 `rwlock`의 `Reader Counter`에 `_QR_BIAS`를 atomic하게 더해주는 함수로 볼 수 있다. `_QR_BIAS`는 `_QR_BIAS	(1U << _QR_SHIFT)`로 정의되어 있고 `_QR_SHIFT`는 9로 정의되어 있다. 즉 이 함수는 `Reader Counter`의 처음 8비트를 건너뛰고 `Counter`에 더해주는 역할을 수행하고 있다. 이제 다시 `qrwlock`의 구조를 보면 `wlocked`가 처음 8비트를 사용하고 있음을 알 수 있다. `read lock`의 경우에는 `wlocked`를 건드리지 않으면서 `Reader Counter`를 업데이트하고 있다. 따라서 `__lstate`의 역할이 실질적인 `Reader Counter`를 나타내는 것임을 알 수 있다.
+
+계속해서 `read lock`을 분석하면 이렇게 얻은 값을 `_QW_WMASK`와 `&`연산을 수행하고 있다. `_QW_WMASK`는 `0x1ff`로 정의되어 있고, 이는 `cnt`의 `wlocked`부분과 `__lstate`의 처음 1비트를 마스킹하고 있다. 이중에서 `0x0ff`의 경우에는 현재 `Writer`가 lock을 잡고 있는지를 나타내는 비트로 `#define	_QW_LOCKED	0x0ff`로 정의되어있다. 또한 1비트의 경우에는 `#define	_QW_WAITING	0x100`로 정의되어 있는데, 이는 현재 `Writer`가 pending 상태에 있음을 알리는 비트이다. 따라서 `Reader Counter`는 `Writer`가 lock을 잡고 있지 않거나 `Writer`가 대기중이 아닐 때 `Reader Counter`를 빠르게 잡을 수 있다. 그렇지 않으면 `slow path`로 넘어가게 된다.
+
+```c
+void __lockfunc queued_read_lock_slowpath(struct qrwlock *lock)
+{
+	if (unlikely(in_interrupt())) {
+		atomic_cond_read_acquire(&lock->cnts, !(VAL & _QW_LOCKED));
+		return;
+	}
+	atomic_sub(_QR_BIAS, &lock->cnts);
+
+	trace_contention_begin(lock, LCB_F_SPIN | LCB_F_READ);
+
+	arch_spin_lock(&lock->wait_lock);
+	atomic_add(_QR_BIAS, &lock->cnts);
+
+	atomic_cond_read_acquire(&lock->cnts, !(VAL & _QW_LOCKED));
+
+	arch_spin_unlock(&lock->wait_lock);
+
+	trace_contention_end(lock, 0);
+}
+```
+`slow path`에서는 우선 `fast path`에서 시도했던 덧셈 연산을 `atomic_sub`를 통해서 취소하고 `writer`가 lock을 놓기를 기다리는 lock인 `wait lock`에 스스로를 추가함을 통해서 `writer`가 lock을 놓기를 기다린다. 이 때 사용하는 lock이 `arch_spinlock_t`으로 정의되어 있었던 `wait_lock`이다. 이후 `writer`가 lock을 풀었다면 이전과 동일하게 `_QR_BIAS`를 더해주고 `Reader Counter`를 업데이트하여 `read lock`을 잡는다.
+
+`unlock`의 경우에는 비교적 단순하게 `Reader Counter`를 `atomic_sub`를 통해서 업데이트하고 있다.
+
+`write lock`의 경우에는 다음과 같이 정의되어 있다.
+```c
+static inline void queued_write_lock(struct qrwlock *lock)
+{
+	int cnts = 0;
+	/* Optimize for the unfair lock case where the fair flag is 0. */
+	if (likely(atomic_try_cmpxchg_acquire(&lock->cnts, &cnts, _QW_LOCKED)))
+		return;
+
+	queued_write_lock_slowpath(lock);
+}
+
+static inline void queued_write_unlock(struct qrwlock *lock)
+{
+	smp_store_release(&lock->wlocked, 0);
+}
+```
+
+위의 `read lock`과 구조가 거의 비슷하면서도 일부 다른 지점이 있다. 먼저 `read lock`에서는 `atomic_add`를 통해서 `Reader Counter`를 업데이트하는 방식이었다면 여기서는 `atomic_try_cmpxchg_acquire`를 통해서 `cnt`변수가 0인지를 확인하고 만일 그러하다면 `Writer`가 lock을 잡았다는 표식인 `_QW_LOCKED`로 변경하도록 하고있다. `cnt`변수가 0이라는 것은 `Reader`나 `Writer`둘다 lock을 잡지 않았다는 것을 의미한다. 따라서 `Writer`가 lock을 잡을 수 있다. 그렇지 않으면 `slow path`로 넘어가게 된다.
+
+```c
+void __lockfunc queued_write_lock_slowpath(struct qrwlock *lock)
+{
+	int cnts;
+
+	trace_contention_begin(lock, LCB_F_SPIN | LCB_F_WRITE);
+
+	/* Put the writer into the wait queue */
+	arch_spin_lock(&lock->wait_lock);
+
+	/* Try to acquire the lock directly if no reader is present */
+	if (!(cnts = atomic_read(&lock->cnts)) &&
+	    atomic_try_cmpxchg_acquire(&lock->cnts, &cnts, _QW_LOCKED))
+		goto unlock;
+
+	/* Set the waiting flag to notify readers that a writer is pending */
+	atomic_or(_QW_WAITING, &lock->cnts);
+
+	/* When no more readers or writers, set the locked flag */
+	do {
+		cnts = atomic_cond_read_relaxed(&lock->cnts, VAL == _QW_WAITING);
+	} while (!atomic_try_cmpxchg_acquire(&lock->cnts, &cnts, _QW_LOCKED));
+unlock:
+	arch_spin_unlock(&lock->wait_lock);
+
+	trace_contention_end(lock, 0);
+}
+```
+
+먼저 `waiting queue`에 스스로를 등록하기 위해서 `wait_lock`를 잡는다. 차례가 온다면 현재의 `cnts`를 읽어서 local 변수 `cnts`에 저장한다. 만일 `cnts`가 0이라면 빠르게 lock을 잡을 수 있으므로 `write lock`을 잡고 `unlock`으로 넘어간다. 그렇지 않으면 `waiting flag`를 설정하고 `Reader`들에게 `Writer`가 pending 상태임을 알린다. 이렇게 되면 `Reader`들은 `fast path`를 사용하지 못하고 `slow path`로 넘어가 `wait list`에 등록된다. 그 다음으로는 `do-while`문을 이용하여 lock을 잡을 때까지 `busy-wait`를 수행한다. 이 과정이 끝나면 `unlock`으로 넘어가게 된다.
+
+`unlock`의 경우에는 `wlocked`를 0으로 만들어주는 것으로 `Writer`가 lock을 풀었음을 알린다.
+
+위의 구현에서 볼 수 있듯이 `rwlock_t`는 근본적으로 `spinlock`방식으로 동작한다. 따라서 만일 우리의 디바이스의 `sector`연산이 충분히 커져서 `context switch`의 overhead를 덮을 수 있을 정도가 된다면 `rwlock`보다는 다른 방식의 synchronize 방법을 사용하는 것이 더 효율적일 수 있다. 그러나 현재의 상황에서는 그렇게 I/O단위가 크지 않기에 `rwlock`이 가장 적합한 방법이라고 볼 수 있다.
+
+참고로 개별적으로 정의되어있는 시스템의 예시로는 `arm`이 있다. `arm`의 경우에는 `arch_rwlock_t`가 다음과 같이 정의되어 있다.
+
+```c
+typedef struct {
+	u32 lock;
+} arch_rwlock_t;
+```
+
+`rw_semaphore`의 경우에는 `rwlock_t`와 비슷한 역할을 수행하지만 그 근본이 `semaphore`이기에 내부 구현은 차이가 있다. `rw_semaphore`의 경우에는 `CONFIG_PREEMPT_RT`옵션에 따라서 그 구현이 다르다. 그러나 본 환경에서는 이 옵션이 켜져있지 않은것으로 확인되었기에 이를 기준으로 작성하겠다.
+
+`rw_semaphore`의 경우에는 다음과 같이 정의되어 있다.
+
+```c
+struct rw_semaphore {
+	atomic_long_t count;
+	/*
+	 * Write owner or one of the read owners as well flags regarding
+	 * the current state of the rwsem. Can be used as a speculative
+	 * check to see if the write owner is running on the cpu.
+	 */
+	atomic_long_t owner;
+#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+	struct optimistic_spin_queue osq; /* spinner MCS lock */
+#endif
+	raw_spinlock_t wait_lock;
+	struct list_head wait_list;
+#ifdef CONFIG_DEBUG_RWSEMS
+	void *magic;
+#endif
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	struct lockdep_map	dep_map;
+#endif
+};
+```
+여기서도 잡다한 디버깅 옵션을 제외하고는 `count`, `owner`, `wait_lock`, `wait_list`가 가장 핵심적인 부분이다. `count`는 `Reader`의 수를 나타내는 변수이다. `owner`는 `Writer`의 상태를 나타내는 변수이다. `wait_lock`은 `Reader`와 `Writer`가 `rw_semaphore`를 기다리는 `spinlock`이다. `wait_list`는 `wait_lock`을 통해 관리되는 `task`들의 리스트이다.
+
+`rw_semaphore`의 API역시 다양한 매크로와 함수로 wrapping되어있지만 핵심적인 부분만 발췌하여 살펴보도록 하겠다. 먼저 `read lock`에 대한 API는 다음과 같다.
+
+```c
+static __always_inline int __down_read_common(struct rw_semaphore *sem, int state)
+{
+	int ret = 0;
+	long count;
+
+	preempt_disable();
+	if (!rwsem_read_trylock(sem, &count)) {
+		if (IS_ERR(rwsem_down_read_slowpath(sem, count, state))) {
+			ret = -EINTR;
+			goto out;
+		}
+		DEBUG_RWSEMS_WARN_ON(!is_rwsem_reader_owned(sem), sem);
+	}
+out:
+	preempt_enable();
+	return ret;
+}
+
+static inline void __up_read(struct rw_semaphore *sem)
+{
+	long tmp;
+
+	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
+	DEBUG_RWSEMS_WARN_ON(!is_rwsem_reader_owned(sem), sem);
+
+	preempt_disable();
+	rwsem_clear_reader_owned(sem);
+	tmp = atomic_long_add_return_release(-RWSEM_READER_BIAS, &sem->count);
+	DEBUG_RWSEMS_WARN_ON(tmp < 0, sem);
+	if (unlikely((tmp & (RWSEM_LOCK_MASK|RWSEM_FLAG_WAITERS)) ==
+		      RWSEM_FLAG_WAITERS)) {
+		clear_nonspinnable(sem);
+		rwsem_wake(sem);
+	}
+	preempt_enable();
+}
+```
+
+```c
+static inline void __up_write(struct rw_semaphore *sem)
+{
+	long tmp;
+
+	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
+	/*
+	 * sem->owner may differ from current if the ownership is transferred
+	 * to an anonymous writer by setting the RWSEM_NONSPINNABLE bits.
+	 */
+	DEBUG_RWSEMS_WARN_ON((rwsem_owner(sem) != current) &&
+			    !rwsem_test_oflags(sem, RWSEM_NONSPINNABLE), sem);
+
+	preempt_disable();
+	rwsem_clear_owner(sem);
+	tmp = atomic_long_fetch_add_release(-RWSEM_WRITER_LOCKED, &sem->count);
+	if (unlikely(tmp & RWSEM_FLAG_WAITERS))
+		rwsem_wake(sem);
+	preempt_enable();
+}
+
+static inline void __up_write(struct rw_semaphore *sem)
+{
+	long tmp;
+
+	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
+	/*
+	 * sem->owner may differ from current if the ownership is transferred
+	 * to an anonymous writer by setting the RWSEM_NONSPINNABLE bits.
+	 */
+	DEBUG_RWSEMS_WARN_ON((rwsem_owner(sem) != current) &&
+			    !rwsem_test_oflags(sem, RWSEM_NONSPINNABLE), sem);
+
+	preempt_disable();
+	rwsem_clear_owner(sem);
+	tmp = atomic_long_fetch_add_release(-RWSEM_WRITER_LOCKED, &sem->count);
+	if (unlikely(tmp & RWSEM_FLAG_WAITERS))
+		rwsem_wake(sem);
+	preempt_enable();
+}
+```
 
 <a name="footnote_1">1</a>: https://junsoolee.gitbook.io/linux-insides-ko/summary/syncprim/linux-sync-4

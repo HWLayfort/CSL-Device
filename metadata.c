@@ -1,6 +1,29 @@
 #include "metadata.h"
 
 /**
+ * print_metadata - Print metadata
+ *
+ * @dev: Device pointer
+ */
+void print_metadata(struct csl_device* dev) {
+	unsigned long idx;
+	struct sector_mapping_entry* ptr;
+	pr_info("%sBlock Map\n", PROMPT);
+
+	pr_info("|--------------------------------------------|\n");
+	pr_info("| Logical Block Index | Phyiscal Block Index |\n");
+	pr_info("|---------------------|----------------------|\n");
+	xa_for_each(&dev->map, idx, ptr)
+	    pr_info("| %-19d | %20d |\n", ptr->l_idx, ptr->p_idx);
+	pr_info("|--------------------------------------------|\n");
+
+	pr_info("%sFree Block Count: %ld\n", PROMPT,
+		list_count_nodes(&dev->freelist));
+	pr_info("%sDirty Block Count: %ld\n", PROMPT,
+		list_count_nodes(&dev->dirtylist));
+}
+
+/**
  * load_ptr - Load a data buffer address from a file
  *
  * @file: File pointer that contains the data buffer address
@@ -264,6 +287,8 @@ int load_metadata(struct csl_device* dev, int reset_device) {
 	file_close(mapfile);
 
 	DEBUG_MESSAGE("%sMetadata loaded\n", PROMPT);
+	if(IS_ENABLED(DEBUG))
+		print_metadata(dev);
 
 	return 0;
 

@@ -13,6 +13,9 @@ mutex:
 semaphore:
 	make -C $(KDIR) M=$(PWD) modules EXTRA_CFLAGS="-D_USE_SEMAPHORE"
 
+rwsem:
+	make -C $(KDIR) M=$(PWD) modules EXTRA_CFLAGS="-D_USE_RWSEMAPHORE"
+
 debug:
 	make -C $(KDIR) M=$(PWD) modules EXTRA_CFLAGS="-DDEBUG"
 
@@ -33,6 +36,9 @@ test:
 	gcc -o test test.c
 	./test
 	rm test
+
+rust-test:
+	cargo run --manifest-path rust-test/Cargo.toml
 
 fio:
 	sudo fio fio_test.fio

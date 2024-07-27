@@ -6,6 +6,7 @@
 #include <linux/semaphore.h>
 #include <linux/types.h>
 #include <linux/xarray.h>
+#include <linux/rwsem.h>
 
 #ifndef __CSL_DEV_TYPES
 #define __CSL_DEV_TYPES
@@ -54,12 +55,14 @@ struct csl_device {
 	struct request_queue* queue;	/* Request queue */
 #ifdef _USE_MUTEX
 	struct mutex reader_cnt_mutex; /* Mutex for reader count */
-	struct mutex rw_mutex;	       /* Mutex for read-write lock */
-	size_t reader_nr;	       /* Read count */
+	struct mutex rw_mutex;	     /* Mutex for read-write lock */
+	size_t reader_nr;	     /* Read count */
 #elif _USE_SEMAPHORE
-	struct semaphore reader_cnt_mutex; /* Semaphore for reader count */
+	struct semaphore reader_cnt_mutex; /* Spinlock for reader count */
 	struct semaphore rw_mutex;	   /* Semaphore for read-write lock */
 	size_t reader_nr;		   /* Read count */
+#elif _USE_RWSEMAPHORE
+	struct rw_semaphore rw_mutex; /* Read-write semaphore */
 #else
 	rwlock_t rwlock; /* Read-write lock */
 #endif
