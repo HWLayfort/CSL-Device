@@ -1106,7 +1106,7 @@ struct rw_semaphore {
 ```
 여기서도 잡다한 디버깅 옵션을 제외하고는 `count`, `owner`, `wait_lock`, `wait_list`가 가장 핵심적인 부분이다. `count`는 `Reader`의 수를 나타내는 변수이다. `owner`는 `Writer`의 상태를 나타내는 변수이다. `wait_lock`은 `Reader`와 `Writer`가 `rw_semaphore`를 기다리는 `spinlock`이다. `wait_list`는 `wait_lock`을 통해 관리되는 `task`들의 리스트이다.
 
-`rw_semaphore`의 API역시 다양한 매크로와 함수로 wrapping되어있지만 핵심적인 부분만 발췌하여 살펴보도록 하겠다. 먼저 `read lock`에 대한 API는 다음과 같다.
+`rw_semaphore`의 API역시 다양한 매크로와 함수로 wrapping되어있지만 핵심적인 부분만 발췌하여 살펴보도록 하겠다. 먼저 `read lock`에서 lock을 잡는 과정은 다음과 같다.
 
 ```c
 static __always_inline int __down_read_common(struct rw_semaphore *sem, int state)
@@ -1126,67 +1126,142 @@ out:
 	preempt_enable();
 	return ret;
 }
-
-static inline void __up_read(struct rw_semaphore *sem)
-{
-	long tmp;
-
-	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
-	DEBUG_RWSEMS_WARN_ON(!is_rwsem_reader_owned(sem), sem);
-
-	preempt_disable();
-	rwsem_clear_reader_owned(sem);
-	tmp = atomic_long_add_return_release(-RWSEM_READER_BIAS, &sem->count);
-	DEBUG_RWSEMS_WARN_ON(tmp < 0, sem);
-	if (unlikely((tmp & (RWSEM_LOCK_MASK|RWSEM_FLAG_WAITERS)) ==
-		      RWSEM_FLAG_WAITERS)) {
-		clear_nonspinnable(sem);
-		rwsem_wake(sem);
-	}
-	preempt_enable();
-}
 ```
+
+우선적으로 눈에 띄는 것은 `preempt_disable`/`preempt_enable`함수이다. 이 함수들은 스케줄링을 지원하는 함수의 실행 금지/허가하는 함수들이다. 즉 `__sched` attribute의 함수의 실행을 차단하는 역할을 수행한다. 이후 `rwsem_read_trylock`을 통해서 `read lock`을 잡을 수 있는지를 확인하고 있다. 만일 이 시도가 실패하였다면 `slow path`로 넘어가게 된다.
 
 ```c
-static inline void __up_write(struct rw_semaphore *sem)
+static struct rw_semaphore __sched *
+rwsem_down_read_slowpath(struct rw_semaphore *sem, long count, unsigned int state)
 {
-	long tmp;
+	long adjustment = -RWSEM_READER_BIAS;
+	long rcnt = (count >> RWSEM_READER_SHIFT);
+	struct rwsem_waiter waiter;
+	DEFINE_WAKE_Q(wake_q);
 
-	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
-	/*
-	 * sem->owner may differ from current if the ownership is transferred
-	 * to an anonymous writer by setting the RWSEM_NONSPINNABLE bits.
-	 */
-	DEBUG_RWSEMS_WARN_ON((rwsem_owner(sem) != current) &&
-			    !rwsem_test_oflags(sem, RWSEM_NONSPINNABLE), sem);
+	if ((atomic_long_read(&sem->owner) & RWSEM_READER_OWNED) &&
+	    (rcnt > 1) && !(count & RWSEM_WRITER_LOCKED))
+		goto queue;
 
-	preempt_disable();
-	rwsem_clear_owner(sem);
-	tmp = atomic_long_fetch_add_release(-RWSEM_WRITER_LOCKED, &sem->count);
-	if (unlikely(tmp & RWSEM_FLAG_WAITERS))
-		rwsem_wake(sem);
-	preempt_enable();
+	if (!(count & (RWSEM_WRITER_LOCKED | RWSEM_FLAG_HANDOFF))) {
+		rwsem_set_reader_owned(sem);
+		lockevent_inc(rwsem_rlock_steal);
+
+		if ((rcnt == 1) && (count & RWSEM_FLAG_WAITERS)) {
+			raw_spin_lock_irq(&sem->wait_lock);
+			if (!list_empty(&sem->wait_list))
+				rwsem_mark_wake(sem, RWSEM_WAKE_READ_OWNED,
+						&wake_q);
+			raw_spin_unlock_irq(&sem->wait_lock);
+			wake_up_q(&wake_q);
+		}
+		return sem;
+	}
+
+queue:
+	...
 }
+```
+`slow path`는 크게 두 부분으로 나뉜다. 첫 번째는 `Reader optimistic lock stealing`파트로 `Reader`가 lock을 잡는 루트이다. 크게 어려운 부분없이 `Reader`가 lock을 잡고 만일 현재 lock을 잡은 `Reader`가 첫 번째 `Reader`라면 wa`wait list`에서 대기중인 `Reader`들을 깨우는 작업을 수행한다.
 
-static inline void __up_write(struct rw_semaphore *sem)
+두 번째는 리눅스의 설명에 의하면 `To prevent a constant stream of readers from starving a sleeping writer`를 위해서 reader가 lock을 잡지않고 writer에게 순서를 양보하는 루트이다. 이 때 조건이 있는데 먼저 당연히 현재 lock을 잡은 `Reader`가 있어야하고, `Reader`의 수가 1보다 커야하며, `trylock`을 시도했을 당시에도 `Writer`가 lock을 잡고 있지 않아야한다. 이러한 조건을 만족하면 `Reader`는 read lock을 잡지 않고 `wait list`에 대기하게 된다. 이러한 방식을 통해 `Reader`가 `Writer`를 기다리는 것을 방지하고 있다. 물론 이곳에서도 몇가지 optimization을 적용하여 가능한 빠르게 lock을 잡을 수 있도록 구현하고 있지만, 해당 루트에 들어온 `Reader`는 `sleep lock`방식으로 lock을 잡게 된다. 이 부분이 `rw_semaphore`와 `rwlock`의 가장 큰 차이점이라고 할 수 있다. `rwlock`의 경우에는 전술하였던 것처럼 `spinlock`을 사용하여 lock을 잡으나 `rw_semaphore`의 경우에는 `sleep lock`을 사용하여 lock을 잡는다.
+
+`write lock`의 경우에는 다음과 같이 정의되어 있다.
+
+```c
+static inline int __down_write_common(struct rw_semaphore *sem, int state)
 {
-	long tmp;
-
-	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
-	/*
-	 * sem->owner may differ from current if the ownership is transferred
-	 * to an anonymous writer by setting the RWSEM_NONSPINNABLE bits.
-	 */
-	DEBUG_RWSEMS_WARN_ON((rwsem_owner(sem) != current) &&
-			    !rwsem_test_oflags(sem, RWSEM_NONSPINNABLE), sem);
+	int ret = 0;
 
 	preempt_disable();
-	rwsem_clear_owner(sem);
-	tmp = atomic_long_fetch_add_release(-RWSEM_WRITER_LOCKED, &sem->count);
-	if (unlikely(tmp & RWSEM_FLAG_WAITERS))
-		rwsem_wake(sem);
+	if (unlikely(!rwsem_write_trylock(sem))) {
+		if (IS_ERR(rwsem_down_write_slowpath(sem, state)))
+			ret = -EINTR;
+	}
 	preempt_enable();
+	return ret;
 }
 ```
 
-<a name="footnote_1">1</a>: https://junsoolee.gitbook.io/linux-insides-ko/summary/syncprim/linux-sync-4
+`write lock`의 경우에도 시작은 `Reader`와 비슷하게 `preempt_disable`/`preempt_enable`함수를 통해서 `context switch`를 막고 `rwsem_write_trylock`을 통해서 lock을 잡을 수 있는지를 확인하고 있다. 만일 이 시도가 실패하였다면 `slow path`로 넘어가게 된다.
+
+```c
+/*
+ * Wait until we successfully acquire the write lock
+ */
+static struct rw_semaphore __sched *
+rwsem_down_write_slowpath(struct rw_semaphore *sem, int state)
+{
+	struct rwsem_waiter waiter;
+	DEFINE_WAKE_Q(wake_q);
+
+	if (rwsem_can_spin_on_owner(sem) && rwsem_optimistic_spin(sem)) {
+		return sem;
+	}
+
+	waiter.task = current;
+	waiter.type = RWSEM_WAITING_FOR_WRITE;
+	waiter.timeout = jiffies + RWSEM_WAIT_TIMEOUT;
+	waiter.handoff_set = false;
+
+	raw_spin_lock_irq(&sem->wait_lock);
+	rwsem_add_waiter(sem, &waiter);
+
+	if (rwsem_first_waiter(sem) != &waiter) {
+		rwsem_cond_wake_waiter(sem, atomic_long_read(&sem->count),
+				       &wake_q);
+		if (!wake_q_empty(&wake_q)) {
+			raw_spin_unlock_irq(&sem->wait_lock);
+			wake_up_q(&wake_q);
+			raw_spin_lock_irq(&sem->wait_lock);
+		}
+	} else {
+		atomic_long_or(RWSEM_FLAG_WAITERS, &sem->count);
+	}
+
+	set_current_state(state);
+	trace_contention_begin(sem, LCB_F_WRITE);
+
+	for (;;) {
+		if (rwsem_try_write_lock(sem, &waiter)) {
+			break;
+		}
+
+		raw_spin_unlock_irq(&sem->wait_lock);
+
+		if (signal_pending_state(state, current))
+			goto out_nolock;
+
+		if (waiter.handoff_set) {
+			enum owner_state owner_state;
+
+			owner_state = rwsem_spin_on_owner(sem);
+			if (owner_state == OWNER_NULL)
+				goto trylock_again;
+		}
+
+		schedule_preempt_disabled();
+		lockevent_inc(rwsem_sleep_writer);
+		set_current_state(state);
+trylock_again:
+		raw_spin_lock_irq(&sem->wait_lock);
+	}
+	__set_current_state(TASK_RUNNING);
+	raw_spin_unlock_irq(&sem->wait_lock);
+	lockevent_inc(rwsem_wlock);
+	trace_contention_end(sem, 0);
+	return sem;
+
+out_nolock:
+	__set_current_state(TASK_RUNNING);
+	raw_spin_lock_irq(&sem->wait_lock);
+	rwsem_del_wake_waiter(sem, &waiter, &wake_q);
+	lockevent_inc(rwsem_wlock_fail);
+	trace_contention_end(sem, -EINTR);
+	return ERR_PTR(-EINTR);
+}
+```
+
+`write lock`의 경우에는 `Reader`과는 다르게 여러 `Writer`가 동시에 `lock`을 잡을 수 없기에 `optimistic lock stealing`을 사용할 수는 없다. 대신에 `optimistic spinning`을 통해서 우선적으로 `sleep`하지 않고 `spin`을 시도하여 빠르게 lock을 잡을 수 있도록 하고있다. 만일 이 과정이 실패하면 `Writer`는 `wait list`에 등록되어 `sleep`하게 된다. 이 과정에서 `Reader`들이 `Writer`를 기다리는 것을 방지하기 위해서 `Reader`들을 깨우는 작업을 수행하고 있다. 이후 `Writer`는 `sleep`하게 되고 `Reader`들이 lock을 잡을 수 있게 된다.
+
+정리하자면 `rwlock`과 `rw_semaphore`은 `Reader-Writer`패턴에 대한 동기화를 위한 구조체이다. `rwlock`은 `spinlock`을 사용하여 lock을 잡는 방식이고 `rw_semaphore`은 `sleep lock`을 사용하여 lock을 잡는 방식이다. 이를 기반으로 `rw_semaphore`의 성능이 저하된 이후를 생각해본다면, 먼저 `read`나 `write`을 단일로 사용했을 때는 `rw_semaphore`이라고 하여도 실재로 `sleep lock`에 들어가는 경우는 그렇게 많지 않았을 것이다. 그러나 `Reader`와 `Writer`가 동시에 많이 발생하는 경우에는 `rw_semaphore`이 `sleep lock`에 들어가는 경우가 많아지게 된다. 이는 `Reader`가 `Writer`를 기다리는 경우가 많아지기 때문이다. 그렇기에 `rw_semaphore`가 `rwlock`보다 성능이 떨어지게 되는 것이다. 따라서 지금의 디바이스와 같이 `Block Size`가 작아서 `Context Switch`의 overhead가 많은 비중을 차지하는 구현이라면 `rwlock`이 더 적합한 방법이라고 할 수 있다.
