@@ -182,7 +182,7 @@ static void write_sector(struct csl_device* dev, unsigned long idx, void* buf,
 		list_del(&free_block->list);
 		ret = IDX_PTR(dev, free_block->idx);
 
-		// insert block into map
+		/* insert block into map */
 		entry = (struct sector_mapping_entry*)kmalloc(
 		    sizeof(struct sector_mapping_entry), GFP_KERNEL);
 		MAPPING_ENTRY_INIT(entry, idx, free_block->idx);
@@ -200,7 +200,7 @@ static void write_sector(struct csl_device* dev, unsigned long idx, void* buf,
 	} else {
 		DEBUG_MESSAGE("%sBlock found in map\n", PROMPT);
 
-		// insert block into dirty list
+		/* insert block into dirty list */
 		struct sector_list_entry* dirty_block =
 		    (struct sector_list_entry*)kmalloc(
 			sizeof(struct sector_list_entry), GFP_KERNEL);
@@ -210,13 +210,13 @@ static void write_sector(struct csl_device* dev, unsigned long idx, void* buf,
 		if (list_empty(&dev->freelist))
 			garbage_collecting(dev);
 
-		// find free block
+		/* find free block */
 		struct sector_list_entry* free_block = list_first_entry(
 		    &dev->freelist, struct sector_list_entry, list);
 		list_del(&free_block->list);
 		ret = IDX_PTR(dev, free_block->idx);
 
-		// insert block into map
+		/* exchange block into map */
 		struct sector_mapping_entry* new_entry =
 		    (struct sector_mapping_entry*)kmalloc(
 			sizeof(struct sector_mapping_entry), GFP_KERNEL);
